@@ -1,7 +1,7 @@
 name: xiaozhi_pet
-description: XiaoZhi AI Pet Robot for Android
+description: Native XiaoZhi AI Pet Robot for Android
 publish_to: 'none'
-version: 1.2.0+3
+version: 2.0.0+4
 
 environment:
   sdk: '>=3.2.0 <4.0.0'
@@ -10,11 +10,16 @@ dependencies:
   flutter:
     sdk: flutter
   http: ^1.2.2
-  web_socket_channel: ^3.0.1
+  http_parser: ^4.0.2
   shared_preferences: ^2.3.2
   sensors_plus: ^6.0.1
-  flutter_tts: ^3.8.5
   speech_to_text: ^6.6.2
+  record: ^5.1.2
+  flutter_pcm_sound: ^3.1.6
+  opus_dart: ^3.0.1
+  opus_flutter: ^3.0.3
+  camera: ^0.11.0+2
+  permission_handler: ^11.3.1
 
 flutter:
   uses-material-design: true
