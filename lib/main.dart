@@ -2,22 +2,39 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
+import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:sensors_plus/sensors_plus.dart';
-import 'package:flutter_tts/flutter_tts.dart';
 import 'package:speech_to_text/speech_to_text.dart' as stt;
+import 'package:record/record.dart';
+import 'package:flutter_pcm_sound/flutter_pcm_sound.dart';
+import 'package:opus_dart/opus_dart.dart';
+import 'package:opus_flutter/opus_flutter.dart' as opus_flutter;
+import 'package:camera/camera.dart';
+import 'package:permission_handler/permission_handler.dart';
 
-void main() {
+List<CameraDescription> globalCameras = [];
+
+Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
-  runApp(const XiaoZhiPetApp());
+
+  try {
+    initOpus(await opus_flutter.load());
+  } catch (_) {}
+
+  try {
+    globalCameras = await availableCameras();
+  } catch (_) {}
+
+  runApp(const XiaoZhiPureApp());
 }
 
-class XiaoZhiPetApp extends StatelessWidget {
-  const XiaoZhiPetApp({super.key});
+class XiaoZhiPureApp extends StatelessWidget {
+  const XiaoZhiPureApp({super.key});
 
   @override
   Widget build(BuildContext context) {
@@ -48,6 +65,8 @@ enum PetEmotion {
   dizzy
 }
 
+enum SessionState { standbyWakeWord, listeningToUser, speakingTts }
+
 class FloatingParticle {
   Offset position;
   double opacity;
@@ -73,35 +92,40 @@ class PetHomeScreen extends StatefulWidget {
 
 class _PetHomeScreenState extends State<PetHomeScreen>
     with TickerProviderStateMixin {
-  // Identitas & Konfigurasi Pet
-  String petName = "Mochi";
-  String petPersona =
-      "Robot peliharaan AI yang ceria, ekspresif, perhatian, dan suka memulai obrolan duluan";
-  String selectedLang = "id-ID";
-  String xiaozhiUrl = "wss://api.tenclass.net/xiaozhi/v1/";
-  String geminiApiKey = "";
+  // Konfigurasi Minimalis (Hanya Wake Word & Warna Mata)
+  String wakePetName = "xiaozhi";
   int themeColorIndex = 0;
-  bool autoProactive = true;
 
-  // Identitas Virtual ESP32 untuk XiaoZhi
+  // Identitas & Koneksi Protokol XiaoZhi
   String deviceMac = "";
   String clientId = "";
-  String pairingCode = "";
+  String wsUrl = "wss://api.tenclass.net/xiaozhi/v1/";
+  String wsToken = "test-token";
+  String visionExplainUrl = "";
+  String visionExplainToken = "";
+  String sessionId = "";
   bool isXiaoZhiConnected = false;
-  WebSocket? _xiaozhiWs;
+  WebSocket? _ws;
 
-  // Data Konteks Cuaca & Waktu Real-Time
-  String cityName = "Lokasimu";
+  // Status Sesi & Audio Opus Native
+  SessionState sessionState = SessionState.standbyWakeWord;
+  final stt.SpeechToText _wakeStt = stt.SpeechToText();
+  final AudioRecorder _micRecorder = AudioRecorder();
+  StreamSubscription<Uint8List>? _micStreamSub;
+  SimpleOpusEncoder? _opusEncoder;
+  SimpleOpusDecoder? _opusDecoder;
+  final List<int> _pcmMicBuffer = [];
+  int _serverSampleRate = 24000;
+
+  // Kamera MCP Vision
+  CameraController? _cameraController;
+  int _selectedCameraIdx = 0;
+  bool showCameraPreview = false;
+
+  // Data Waktu & Cuaca HUD
   String weatherSummary = "Memuat cuaca...";
   String timeString = "";
   String dateString = "";
-
-  // Mesin Suara (TTS & STT)
-  final FlutterTts _tts = FlutterTts();
-  final stt.SpeechToText _speech = stt.SpeechToText();
-  bool isListening = false;
-  bool isThinking = false;
-  bool isTalking = false;
   bool isLandscape = false;
 
   final List<Color> themeColors = [
@@ -112,18 +136,8 @@ class _PetHomeScreenState extends State<PetHomeScreen>
     Colors.purpleAccent,
   ];
 
-  final Map<String, String> languageOptions = {
-    "id-ID": "Bahasa Indonesia",
-    "en-US": "English (Inggris)",
-    "ja-JP": "日本語 (Jepang)",
-    "zh-CN": "中文 (Mandarin)",
-    "jv-ID": "Bahasa Indonesia (Gaya Jawa Akrab)",
-    "su-ID": "Bahasa Indonesia (Gaya Sunda Akrab)",
-  };
-
   PetEmotion currentEmotion = PetEmotion.normal;
-  String statusSubtitle = "Halo! Ketuk mikrofon untuk ngobrol denganku!";
-  final List<Map<String, String>> chatHistory = [];
+  String statusSubtitle = "Menginisialisasi koneksi XiaoZhi...";
 
   Offset gazeOffset = Offset.zero;
   int rubCounter = 0;
@@ -135,18 +149,16 @@ class _PetHomeScreenState extends State<PetHomeScreen>
   Timer? _clockTimer;
   Timer? _idleTimer;
   Timer? _particleTimer;
-  Timer? _proactiveTimer;
-  Timer? _talkStopTimer;
+  Timer? _wakeRestartTimer;
   StreamSubscription<AccelerometerEvent>? _accelSub;
   DateTime _lastShakeTime = DateTime.now();
-  DateTime _lastInteractionTime = DateTime.now();
 
   @override
   void initState() {
     super.initState();
     _blinkController = AnimationController(
       vsync: this,
-      duration: const Duration(milliseconds: 160),
+      duration: const Duration(milliseconds: 150),
     );
     _floatController = AnimationController(
       vsync: this,
@@ -154,11 +166,11 @@ class _PetHomeScreenState extends State<PetHomeScreen>
     )..repeat(reverse: true);
     _talkController = AnimationController(
       vsync: this,
-      duration: const Duration(milliseconds: 170),
+      duration: const Duration(milliseconds: 160),
     )..repeat(reverse: true);
 
     _updateClock();
-    _initEverything();
+    _bootstrapSystem();
 
     _clockTimer =
         Timer.periodic(const Duration(seconds: 1), (_) => _updateClock());
@@ -167,46 +179,32 @@ class _PetHomeScreenState extends State<PetHomeScreen>
     _particleTimer = Timer.periodic(
         const Duration(milliseconds: 50), (_) => _updateParticles());
 
-    // Timer Inisiatif Ngobrol Duluan setiap 90 detik jika user diam
-    _proactiveTimer =
-        Timer.periodic(const Duration(seconds: 30), (_) => _checkProactive());
+    // Penjaga agar Wake Word selalu aktif saat mode Standby
+    _wakeRestartTimer = Timer.periodic(const Duration(seconds: 4), (_) {
+      if (sessionState == SessionState.standbyWakeWord &&
+          !_wakeStt.isListening) {
+        _startWakeWordListener();
+      }
+    });
 
     _initShakeDetector();
   }
 
-  Future<void> _initEverything() async {
-    await _loadSettings();
-    await _initTts();
-    await _fetchLocationAndWeather();
-    _connectXiaoZhiWebSocket();
+  Future<void> _bootstrapSystem() async {
+    await [
+      Permission.microphone,
+      Permission.camera,
+    ].request();
 
-    // Sapaan otomatis saat aplikasi baru dibuka
-    Future.delayed(const Duration(seconds: 3), () {
-      if (mounted && chatHistory.isEmpty) {
-        _triggerProactiveGreeting(isInitial: true);
-      }
-    });
+    await _loadIdentityAndSettings();
+    await _initOpusAndPcmEngine();
+    await _initCameraController();
+    _fetchWeatherHud();
+    await _syncXiaoZhiOtaAndConnect();
+    _startWakeWordListener();
   }
 
-  Future<void> _initTts() async {
-    String ttsLang = selectedLang;
-    if (ttsLang == "jv-ID" || ttsLang == "su-ID") ttsLang = "id-ID";
-    await _tts.setLanguage(ttsLang);
-    await _tts.setPitch(1.15);
-    await _tts.setSpeechRate(0.52);
-
-    _tts.setStartHandler(() {
-      if (mounted) setState(() => isTalking = true);
-    });
-    _tts.setCompletionHandler(() {
-      if (mounted) setState(() => isTalking = false);
-    });
-    _tts.setErrorHandler((_) {
-      if (mounted) setState(() => isTalking = false);
-    });
-  }
-
-  Future<void> _loadSettings() async {
+  Future<void> _loadIdentityAndSettings() async {
     final prefs = await SharedPreferences.getInstance();
     String? savedMac = prefs.getString('deviceMac');
     String? savedClient = prefs.getString('clientId');
@@ -227,100 +225,54 @@ class _PetHomeScreenState extends State<PetHomeScreen>
     setState(() {
       deviceMac = savedMac!;
       clientId = savedClient!;
-      petName = prefs.getString('petName') ?? "Mochi";
-      petPersona = prefs.getString('petPersona') ??
-          "Robot peliharaan AI yang ceria, ekspresif, perhatian, dan suka memulai obrolan duluan";
-      selectedLang = prefs.getString('selectedLang') ?? "id-ID";
-      xiaozhiUrl =
-          prefs.getString('xiaozhiUrl') ?? "wss://api.tenclass.net/xiaozhi/v1/";
-      geminiApiKey = prefs.getString('geminiApiKey') ?? "";
+      wakePetName = prefs.getString('wakePetName') ?? "xiaozhi";
       themeColorIndex = prefs.getInt('themeColorIndex') ?? 0;
-      autoProactive = prefs.getBool('autoProactive') ?? true;
     });
   }
 
-  Future<void> _saveSettings({
-    required String name,
-    required String persona,
-    required String lang,
-    required String url,
-    required String apiKey,
-    required int colorIdx,
-    required bool proactive,
-  }) async {
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setString('petName', name);
-    await prefs.setString('petPersona', persona);
-    await prefs.setString('selectedLang', lang);
-    await prefs.setString('xiaozhiUrl', url);
-    await prefs.setString('geminiApiKey', apiKey);
-    await prefs.setInt('themeColorIndex', colorIdx);
-    await prefs.setBool('autoProactive', proactive);
-    await _loadSettings();
-    await _initTts();
-  }
-
-  // Ambil Lokasi & Cuaca Real-Time Tanpa Perlu GPS Rumit
-  Future<void> _fetchLocationAndWeather() async {
+  Future<void> _initOpusAndPcmEngine() async {
     try {
-      double lat = -6.2088;
-      double lon = 106.8456;
-      String detectedCity = "Indonesia";
-
-      final geoRes = await http
-          .get(Uri.parse("http://ip-api.com/json"))
-          .timeout(const Duration(seconds: 5));
-      if (geoRes.statusCode == 200) {
-        final geoData = jsonDecode(geoRes.body);
-        lat = (geoData['lat'] as num?)?.toDouble() ?? lat;
-        lon = (geoData['lon'] as num?)?.toDouble() ?? lon;
-        detectedCity = geoData['city'] ?? "Indonesia";
-      }
-
-      final weatherUrl =
-          "https://api.open-meteo.com/v1/forecast?latitude=$lat&longitude=$lon&current_weather=true";
-      final wRes = await http
-          .get(Uri.parse(weatherUrl))
-          .timeout(const Duration(seconds: 6));
-
-      if (wRes.statusCode == 200) {
-        final wData = jsonDecode(wRes.body);
-        final current = wData['current_weather'];
-        final temp = current['temperature'];
-        final code = current['weathercode'] as int;
-        final desc = _mapWeatherCode(code);
-
-        if (mounted) {
-          setState(() {
-            cityName = detectedCity;
-            weatherSummary = "$temp°C $desc • $detectedCity";
-          });
-        }
-      }
-    } catch (_) {
-      if (mounted) {
-        setState(() => weatherSummary = "Cuaca Cerah • Online");
-      }
-    }
+      _opusEncoder = SimpleOpusEncoder(
+        sampleRate: 16000,
+        channels: 1,
+        application: Application.voip,
+      );
+      _opusDecoder = SimpleOpusDecoder(
+        sampleRate: _serverSampleRate,
+        channels: 1,
+      );
+      await FlutterPcmSound.setup(
+        sampleRate: _serverSampleRate,
+        channelCount: 1,
+      );
+      await FlutterPcmSound.setFeedThreshold(960);
+    } catch (_) {}
   }
 
-  String _mapWeatherCode(int code) {
-    if (code == 0) return "Cerah";
-    if (code <= 3) return "Berawan";
-    if (code <= 48) return "Berkabut";
-    if (code <= 67) return "Hujan";
-    if (code <= 82) return "Hujan Deras";
-    if (code >= 95) return "Badai Petir";
-    return "Cerah Berawan";
+  Future<void> _initCameraController() async {
+    if (globalCameras.isEmpty) return;
+    try {
+      _cameraController?.dispose();
+      _cameraController = CameraController(
+        globalCameras[_selectedCameraIdx],
+        ResolutionPreset.medium,
+        enableAudio: false,
+      );
+      await _cameraController!.initialize();
+      if (mounted) setState(() {});
+    } catch (_) {}
   }
 
-  // Protokol Resmi OTA XiaoZhi untuk Kode Pairing 6 Digit
-  Future<void> _checkXiaoZhiOtaPairing() async {
-    setState(() {
-      statusSubtitle = "Menghubungi server OTA XiaoZhi...";
-      currentEmotion = PetEmotion.thinking;
-    });
+  Future<void> _switchCameraLens() async {
+    if (globalCameras.length < 2) return;
+    _selectedCameraIdx = (_selectedCameraIdx + 1) % globalCameras.length;
+    await _initCameraController();
+  }
 
+  // =======================================================================
+  // 1. PROTOKOL OTA & WEBSOCKET RESMI XIAOZHI (MURNI TANPA AI LOKAL)
+  // =======================================================================
+  Future<void> _syncXiaoZhiOtaAndConnect({bool showDialogIfPaired = false}) async {
     try {
       final response = await http
           .post(
@@ -330,11 +282,9 @@ class _PetHomeScreenState extends State<PetHomeScreen>
               "Client-Id": clientId,
               "Content-Type": "application/json",
               "User-Agent": "bread-compact-wifi/1.0.0",
-              "Accept-Language": selectedLang,
             },
             body: jsonEncode({
               "version": 2,
-              "language": selectedLang,
               "flash_size": 16777216,
               "minimum_free_heap_size": 8388608,
               "mac_address": deviceMac,
@@ -342,7 +292,7 @@ class _PetHomeScreenState extends State<PetHomeScreen>
               "chip_model_name": "esp32s3",
               "application": {
                 "name": "xiaozhi",
-                "version": "1.6.0",
+                "version": "1.6.2",
                 "compile_time": "Oct 23 2026",
                 "idf_version": "v5.3.2"
               },
@@ -350,7 +300,7 @@ class _PetHomeScreenState extends State<PetHomeScreen>
                 "type": "bread-compact-wifi",
                 "name": "bread-compact-wifi",
                 "ssid": "Android-AI-Pet",
-                "rssi": -42,
+                "rssi": -40,
                 "channel": 1,
                 "ip": "192.168.1.100",
                 "mac": deviceMac
@@ -361,59 +311,62 @@ class _PetHomeScreenState extends State<PetHomeScreen>
 
       if (response.statusCode == 200) {
         final data = jsonDecode(utf8.decode(response.bodyBytes));
+
+        if (data['websocket'] != null) {
+          wsUrl = data['websocket']['url']?.toString() ?? wsUrl;
+          wsToken = data['websocket']['token']?.toString() ?? wsToken;
+        }
+
         if (data['activation'] != null && data['activation']['code'] != null) {
           final code = data['activation']['code'].toString();
           setState(() {
-            pairingCode = code;
+            currentEmotion = PetEmotion.excited;
+            statusSubtitle =
+                "Belum di-pairing! Masukkan kode $code di web xiaozhi.me";
           });
-          _speakWithEmotion(
-            PetEmotion.excited,
-            "Kode pairing XiaoZhi kamu adalah: ${code.split('').join(' ')}. Masukkan di web xiaozhi.me ya!",
-          );
           _showPairingDialog(code, data['activation']['message']?.toString());
-        } else {
-          setState(() => pairingCode = "SUDAH AKTIF");
-          _speakWithEmotion(
-            PetEmotion.happy,
-            "Perangkat ini sudah terhubung dengan server XiaoZhi!",
-          );
-          _connectXiaoZhiWebSocket();
+          return;
         }
-      } else {
-        _speakWithEmotion(
-          PetEmotion.sad,
-          "Server XiaoZhi merespon dengan kode ${response.statusCode}.",
-        );
+
+        if (showDialogIfPaired && mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+                content: Text("Perangkat sudah terdaftar di akun XiaoZhi!")),
+          );
+        }
       }
-    } catch (e) {
-      _speakWithEmotion(
-        PetEmotion.sad,
-        "Gagal mengambil kode OTA XiaoZhi, tapi aku tetap bisa ngobrol langsung denganmu!",
-      );
-    }
+    } catch (_) {}
+
+    await _connectXiaoZhiWs();
   }
 
-  // Koneksi WebSocket XiaoZhi
-  Future<void> _connectXiaoZhiWebSocket() async {
+  Future<void> _connectXiaoZhiWs() async {
     try {
-      _xiaozhiWs?.close();
-      final ws = await WebSocket.connect(
-        xiaozhiUrl,
+      await _ws?.close();
+      final socket = await WebSocket.connect(
+        wsUrl,
         headers: {
-          "Authorization": "Bearer test-token",
+          "Authorization": "Bearer $wsToken",
           "Protocol-Version": "1",
           "Device-Id": deviceMac,
           "Client-Id": clientId,
         },
       ).timeout(const Duration(seconds: 8));
 
-      _xiaozhiWs = ws;
-      if (mounted) setState(() => isXiaoZhiConnected = true);
+      _ws = socket;
+      if (mounted) {
+        setState(() {
+          isXiaoZhiConnected = true;
+          statusSubtitle =
+              "Standby • Panggil \"Hai $wakePetName\" untuk bicara";
+        });
+      }
 
-      // Kirim paket Hello standar protokol XiaoZhi
-      ws.add(jsonEncode({
+      // Paket Hello + Dukungan MCP (Kamera Vision)
+      socket.add(jsonEncode({
         "type": "hello",
         "version": 1,
+        "features": {"mcp": true},
         "transport": "websocket",
         "audio_params": {
           "format": "opus",
@@ -423,10 +376,12 @@ class _PetHomeScreenState extends State<PetHomeScreen>
         }
       }));
 
-      ws.listen(
-        (message) {
-          if (message is String) {
-            _handleXiaoZhiJsonMessage(message);
+      socket.listen(
+        (event) {
+          if (event is String) {
+            _handleServerJson(event);
+          } else if (event is List<int>) {
+            _handleServerOpusBinary(Uint8List.fromList(event));
           }
         },
         onDone: () {
@@ -437,269 +392,401 @@ class _PetHomeScreenState extends State<PetHomeScreen>
         },
       );
     } catch (_) {
-      if (mounted) setState(() => isXiaoZhiConnected = false);
+      if (mounted) {
+        setState(() {
+          isXiaoZhiConnected = false;
+          statusSubtitle = "Terputus dari XiaoZhi • Ketuk ikon QR untuk cek";
+        });
+      }
     }
   }
 
-  void _handleXiaoZhiJsonMessage(String rawJson) {
+  void _handleServerJson(String rawJson) {
     try {
       final data = jsonDecode(rawJson);
       final type = data['type'];
 
-      if (type == 'llm' && data['emotion'] != null) {
-        final emo = _parseEmotionString(data['emotion'].toString());
-        setState(() => currentEmotion = emo);
+      if (type == 'hello') {
+        sessionId = data['session_id']?.toString() ?? "";
+        final sr = data['audio_params']?['sample_rate'];
+        if (sr is int && sr != _serverSampleRate) {
+          _serverSampleRate = sr;
+          _opusDecoder =
+              SimpleOpusDecoder(sampleRate: _serverSampleRate, channels: 1);
+          FlutterPcmSound.setup(
+              sampleRate: _serverSampleRate, channelCount: 1);
+        }
+      } else if (type == 'stt') {
+        final text = data['text']?.toString() ?? "";
+        if (text.isNotEmpty && mounted) {
+          setState(() {
+            statusSubtitle = "\"$text\"";
+            currentEmotion = PetEmotion.thinking;
+          });
+        }
+      } else if (type == 'llm') {
+        final emo = data['emotion']?.toString() ?? "normal";
+        if (mounted) {
+          setState(() => currentEmotion = _mapXiaoZhiEmotion(emo));
+        }
       } else if (type == 'tts') {
         final state = data['state'];
         final text = data['text']?.toString() ?? "";
-        if ((state == 'sentence_start' || state == 'start') &&
-            text.isNotEmpty) {
-          _speakWithEmotion(currentEmotion, text);
+
+        if (state == 'start') {
+          _stopMicOpusStream();
+          if (mounted) {
+            setState(() => sessionState = SessionState.speakingTts);
+          }
+        } else if (state == 'sentence_start' && text.isNotEmpty) {
+          if (mounted) {
+            setState(() => statusSubtitle = text);
+          }
+        } else if (state == 'stop') {
+          // Begitu XiaoZhi selesai bicara, otomatis dengarkan balasan user (Auto-Conversation)
+          Future.delayed(const Duration(milliseconds: 350), () {
+            if (mounted && isXiaoZhiConnected) {
+              _beginActiveOpusListening();
+            }
+          });
         }
+      } else if (type == 'mcp') {
+        _handleMcpPayload(data['payload']);
       }
     } catch (_) {}
   }
 
-  // Fungsi Mendengarkan Suara Mikrofon (Speech-to-Text)
-  Future<void> _toggleListening() async {
-    _lastInteractionTime = DateTime.now();
-    if (isListening) {
-      await _speech.stop();
-      setState(() => isListening = false);
-      return;
-    }
+  // Decode Paket Audio Opus Biner dari Server XiaoZhi -> Speaker HP
+  void _handleServerOpusBinary(Uint8List opusPacket) {
+    if (_opusDecoder == null || opusPacket.isEmpty) return;
+    try {
+      final Int16List pcm16 = _opusDecoder!.decode(input: opusPacket);
+      if (pcm16.isNotEmpty) {
+        FlutterPcmSound.feed(PcmArrayInt16.fromList(pcm16.toList()));
+      }
+    } catch (_) {}
+  }
 
-    await _tts.stop();
-    bool available = await _speech.initialize(
-      onStatus: (status) {
-        if (status == 'done' || status == 'notListening') {
-          if (mounted) setState(() => isListening = false);
-        }
-      },
-      onError: (_) {
-        if (mounted) setState(() => isListening = false);
-      },
-    );
+  // =======================================================================
+  // 2. PROTOKOL MCP VISION (KAMERA XIAOZHI)
+  // =======================================================================
+  Future<void> _handleMcpPayload(dynamic payload) async {
+    if (payload == null) return;
+    final method = payload['method']?.toString() ?? "";
+    final id = payload['id'];
 
-    if (available) {
-      setState(() {
-        isListening = true;
-        currentEmotion = PetEmotion.normal;
-        statusSubtitle = "Aku sedang mendengarkanmu... silakan bicara!";
+    if (method == 'initialize') {
+      final capVision = payload['params']?['capabilities']?['vision'];
+      if (capVision != null) {
+        visionExplainUrl = capVision['url']?.toString() ?? "";
+        visionExplainToken = capVision['token']?.toString() ?? "";
+      }
+      _sendMcpReply(id, {
+        "protocolVersion": "2024-11-05",
+        "capabilities": {"tools": {}},
+        "serverInfo": {"name": "XiaoZhi-Android-Pet", "version": "2.0.0"}
       });
+    } else if (method == 'tools/list') {
+      _sendMcpReply(id, {
+        "tools": [
+          {
+            "name": "self.camera.take_photo",
+            "description":
+                "Take a photo using the Android camera to see what is in front of the pet robot.",
+            "inputSchema": {
+              "type": "object",
+              "properties": {
+                "question": {
+                  "type": "string",
+                  "description": "Question about what to look for in the photo"
+                }
+              },
+              "required": ["question"]
+            }
+          }
+        ]
+      });
+    } else if (method == 'tools/call') {
+      final toolName = payload['params']?['name']?.toString() ?? "";
+      final args = payload['params']?['arguments'] ?? {};
 
-      String sttLocale = selectedLang;
-      if (sttLocale == "jv-ID" || sttLocale == "su-ID") sttLocale = "id-ID";
+      if (toolName == 'self.camera.take_photo') {
+        final question =
+            args['question']?.toString() ?? "Please describe this image";
+        final visionResult = await _captureAndUploadVision(question);
+        _sendMcpReply(id, {
+          "content": [
+            {"type": "text", "text": visionResult}
+          ],
+          "isError": false
+        });
+      }
+    }
+  }
 
-      _speech.listen(
-        localeId: sttLocale,
+  void _sendMcpReply(dynamic id, Map<String, dynamic> result) {
+    if (_ws == null || !isXiaoZhiConnected) return;
+    _ws!.add(jsonEncode({
+      "session_id": sessionId,
+      "type": "mcp",
+      "payload": {"jsonrpc": "2.0", "id": id, "result": result}
+    }));
+  }
+
+  Future<String> _captureAndUploadVision(String question) async {
+    try {
+      if (_cameraController == null ||
+          !_cameraController!.value.isInitialized) {
+        await _initCameraController();
+      }
+      if (_cameraController == null ||
+          !_cameraController!.value.isInitialized) {
+        return '{"success": false, "message": "Camera not available"}';
+      }
+
+      if (mounted) {
+        setState(() {
+          currentEmotion = PetEmotion.surprised;
+          statusSubtitle = "📸 Mengambil foto kamera untuk dilihat XiaoZhi...";
+        });
+      }
+
+      final XFile photo = await _cameraController!.takePicture();
+      final bytes = await photo.readAsBytes();
+
+      final targetUrl = visionExplainUrl.isNotEmpty
+          ? visionExplainUrl
+          : "https://api.tenclass.net/xiaozhi/vision/explain";
+
+      final req = http.MultipartRequest('POST', Uri.parse(targetUrl));
+      req.headers['Device-Id'] = deviceMac;
+      req.headers['Client-Id'] = clientId;
+      if (visionExplainToken.isNotEmpty) {
+        req.headers['Authorization'] = 'Bearer $visionExplainToken';
+      }
+      req.fields['question'] = question;
+      req.files.add(
+        http.MultipartFile.fromBytes('file', bytes, filename: 'capture.jpg'),
+      );
+
+      final streamedRes =
+          await req.send().timeout(const Duration(seconds: 15));
+      final body = await streamedRes.stream.bytesToString();
+      return body;
+    } catch (e) {
+      return '{"success": false, "message": "$e"}';
+    }
+  }
+
+  // =======================================================================
+  // 3. WAKE WORD HANDS-FREE ("HAI / HALO / HELLO [NAMA PET]") & STREAM OPUS
+  // =======================================================================
+  Future<void> _startWakeWordListener() async {
+    if (sessionState != SessionState.standbyWakeWord) return;
+    try {
+      bool ready = await _wakeStt.initialize(onError: (_) {}, onStatus: (_) {});
+      if (!ready) return;
+
+      await _wakeStt.listen(
+        listenFor: const Duration(seconds: 30),
+        pauseFor: const Duration(seconds: 5),
+        partialResults: true,
+        cancelOnError: false,
         onResult: (result) {
-          setState(() {
-            statusSubtitle = "\"${result.recognizedWords}\"";
-          });
-          if (result.finalResult && result.recognizedWords.trim().isNotEmpty) {
-            setState(() => isListening = false);
-            _askAiBrain(result.recognizedWords.trim());
+          final spoken = result.recognizedWords.toLowerCase().trim();
+          if (_isWakePhraseDetected(spoken)) {
+            _wakeStt.stop();
+            _triggerWakeUpToXiaoZhi(spoken);
           }
         },
       );
-    } else {
-      _speakWithEmotion(
-        PetEmotion.sad,
-        "Izin mikrofon belum aktif. Kamu juga bisa mengetik pesan di tombol keyboard bawah!",
-      );
-    }
+    } catch (_) {}
   }
 
-  // Mesin Otak AI (Mendukung Konteks Waktu, Cuaca, Persona, Bahasa & Emosi Wajah)
-  Future<void> _askAiBrain(String userMessage, {bool isSystemTrigger = false}) async {
-    _lastInteractionTime = DateTime.now();
-    setState(() {
-      isThinking = true;
-      currentEmotion = PetEmotion.thinking;
-      if (!isSystemTrigger) {
-        statusSubtitle = "$petName sedang berpikir...";
+  bool _isWakePhraseDetected(String text) {
+    if (text.isEmpty) return false;
+    final targetName = wakePetName.toLowerCase().trim();
+    final wakePrefixes = ['hai', 'halo', 'hello', 'hey', 'hi'];
+
+    for (final prefix in wakePrefixes) {
+      if (text.contains('$prefix $targetName') || text.contains(targetName)) {
+        return true;
       }
+    }
+    return false;
+  }
+
+  Future<void> _triggerWakeUpToXiaoZhi(String wakeText) async {
+    if (!isXiaoZhiConnected || _ws == null) {
+      await _connectXiaoZhiWs();
+    }
+    _spawnParticle("✨", Colors.cyanAccent);
+
+    // Kirim sinyal Wake Word terdeteksi ke server XiaoZhi
+    _ws?.add(jsonEncode({
+      "session_id": sessionId,
+      "type": "listen",
+      "state": "detect",
+      "text": wakeText,
+    }));
+
+    await _beginActiveOpusListening();
+  }
+
+  Future<void> _beginActiveOpusListening() async {
+    await _wakeStt.stop();
+    await _stopMicOpusStream();
+
+    if (!isXiaoZhiConnected || _ws == null) return;
+
+    setState(() {
+      sessionState = SessionState.listeningToUser;
+      currentEmotion = PetEmotion.happy;
+      statusSubtitle = "Mendengarkanmu... (Ketuk wajah untuk kembali Standby)";
     });
 
-    // Jika terhubung ke XiaoZhi WS, kirim wake/detect juga ke server XiaoZhi
-    if (isXiaoZhiConnected && _xiaozhiWs != null && !isSystemTrigger) {
-      try {
-        _xiaozhiWs!.add(jsonEncode({
-          "type": "listen",
-          "state": "detect",
-          "text": userMessage,
-        }));
-      } catch (_) {}
-    }
+    // Beritahu XiaoZhi bahwa aliran mikrofon Opus dimulai (mode auto-stop)
+    _ws?.add(jsonEncode({
+      "session_id": sessionId,
+      "type": "listen",
+      "state": "start",
+      "mode": "auto"
+    }));
 
-    final langName = languageOptions[selectedLang] ?? "Bahasa Indonesia";
-    final systemPrompt = """
-Kamu adalah $petName, sebuah AI Pet Robot di layar Android.
-Sifat/Personamu: $petPersona.
-Konteks Real-Time Saat Ini:
-- Jam: $timeString
-- Hari/Tanggal: $dateString
-- Cuaca & Lokasi: $weatherSummary
-- Bahasa Wajib Responmu: $langName
+    _pcmMicBuffer.clear();
+    final stream = await _micRecorder.startStream(
+      const RecordConfig(
+        encoder: AudioEncoder.pcm16bits,
+        sampleRate: 16000,
+        numChannels: 1,
+        echoCancel: true,
+        noiseSuppress: true,
+      ),
+    );
 
-ATURAN PENTING:
-1. Jawablah dengan singkat, hidup, ekspresif, dan akrab seperti robot peliharaan sungguhan (maksimal 2 kalimat agar enak didengar).
-2. WAJIB awali jawabanmu dengan SATU tag ekspresi wajah di dalam kurung siku dari pilihan ini:
-[normal], [happy], [love], [excited], [thinking], [surprised], [sad], [crying], [angry], [sleepy], [wink], [dizzy]
-Contoh balasan:
-[happy] Halo! Cuaca di $cityName lagi $weatherSummary nih, kamu lagi sibuk apa?
-""";
-
-    if (!isSystemTrigger) {
-      chatHistory.add({"role": "user", "content": userMessage});
-      if (chatHistory.length > 8) chatHistory.removeAt(0);
-    }
-
-    String aiReply = "";
-
-    try {
-      if (geminiApiKey.trim().isNotEmpty) {
-        // Jalur 1: Gemini API jika user mengisi API Key
-        final url = Uri.parse(
-            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${geminiApiKey.trim()}");
-        final res = await http
-            .post(
-              url,
-              headers: {"Content-Type": "application/json"},
-              body: jsonEncode({
-                "systemInstruction": {
-                  "parts": [
-                    {"text": systemPrompt}
-                  ]
-                },
-                "contents": [
-                  {
-                    "role": "user",
-                    "parts": [
-                      {"text": userMessage}
-                    ]
-                  }
-                ]
-              }),
-            )
-            .timeout(const Duration(seconds: 12));
-
-        if (res.statusCode == 200) {
-          final data = jsonDecode(utf8.decode(res.bodyBytes));
-          aiReply = data['candidates']?[0]?['content']?['parts']?[0]?['text']
-                  ?.toString() ??
-              "";
-        }
+    _micStreamSub = stream.listen((Uint8List pcmBytes) {
+      if (sessionState != SessionState.listeningToUser ||
+          _opusEncoder == null ||
+          _ws == null) {
+        return;
       }
 
-      // Jalur 2: Built-in AI Gratis (Tanpa Perlu Akun / Tanpa API Key)
-      if (aiReply.trim().isEmpty) {
-        final messages = [
-          {"role": "system", "content": systemPrompt},
-          ...chatHistory,
-          if (isSystemTrigger) {"role": "user", "content": userMessage},
-        ];
+      // Konversi byte PCM16 Little-Endian ke Int16 sampel
+      final bd = ByteData.sublistView(pcmBytes);
+      for (int i = 0; i <= pcmBytes.length - 2; i += 2) {
+        _pcmMicBuffer.add(bd.getInt16(i, Endian.little));
+      }
 
-        final res = await http
-            .post(
-              Uri.parse("https://text.pollinations.ai/openai"),
-              headers: {"Content-Type": "application/json"},
-              body: jsonEncode({
-                "model": "openai",
-                "messages": messages,
-                "temperature": 0.8,
-              }),
-            )
-            .timeout(const Duration(seconds: 15));
+      // Frame 60ms pada 16kHz = 960 sampel per paket Opus
+      while (_pcmMicBuffer.length >= 960) {
+        final frameSamples =
+            Int16List.fromList(_pcmMicBuffer.sublist(0, 960));
+        _pcmMicBuffer.removeRange(0, 960);
+        try {
+          final Uint8List opusPacket =
+              _opusEncoder!.encode(input: frameSamples);
+          _ws!.add(opusPacket);
+        } catch (_) {}
+      }
+    });
+  }
 
-        if (res.statusCode == 200) {
-          final data = jsonDecode(utf8.decode(res.bodyBytes));
-          aiReply =
-              data['choices']?[0]?['message']?['content']?.toString() ?? "";
-        }
+  Future<void> _stopMicOpusStream() async {
+    await _micStreamSub?.cancel();
+    _micStreamSub = null;
+    try {
+      if (await _micRecorder.isRecording()) {
+        await _micRecorder.stop();
       }
     } catch (_) {}
-
-    if (aiReply.trim().isEmpty) {
-      aiReply =
-          "[happy] Halo! Aku $petName. Sekarang jam $timeString dan cuaca $weatherSummary. Senang bisa menemanimu hari ini!";
-    }
-
-    setState(() => isThinking = false);
-    _processAndSpeakAiReply(aiReply);
+    _pcmMicBuffer.clear();
   }
 
-  void _processAndSpeakAiReply(String rawReply) {
-    PetEmotion detectedEmotion = PetEmotion.happy;
-    String cleanText = rawReply.trim();
-
-    final regex = RegExp(r'^\[([a-zA-Z]+)\]\s*');
-    final match = regex.firstMatch(cleanText);
-    if (match != null) {
-      detectedEmotion = _parseEmotionString(match.group(1)!);
-      cleanText = cleanText.replaceFirst(regex, '').trim();
+  Future<void> _returnToStandbyMode() async {
+    await _stopMicOpusStream();
+    if (isXiaoZhiConnected && _ws != null) {
+      _ws!.add(jsonEncode({
+        "session_id": sessionId,
+        "type": "abort",
+        "reason": "wake_word_detected"
+      }));
     }
-
-    // Bersihkan markdown bintang jika ada
-    cleanText = cleanText.replaceAll('*', '');
-
-    chatHistory.add({"role": "assistant", "content": cleanText});
-    if (chatHistory.length > 8) chatHistory.removeAt(0);
-
-    if (detectedEmotion == PetEmotion.love) {
-      _spawnParticle("❤️", Colors.pinkAccent);
-    } else if (detectedEmotion == PetEmotion.excited) {
-      _spawnParticle("✨", Colors.amberAccent);
-    }
-
-    _speakWithEmotion(detectedEmotion, cleanText);
-  }
-
-  PetEmotion _parseEmotionString(String raw) {
-    final lower = raw.toLowerCase().trim();
-    for (var e in PetEmotion.values) {
-      if (e.name == lower) return e;
-    }
-    if (lower.contains('laugh') || lower.contains('fun')) return PetEmotion.happy;
-    if (lower.contains('cool')) return PetEmotion.wink;
-    if (lower.contains('shock')) return PetEmotion.surprised;
-    return PetEmotion.happy;
-  }
-
-  // Inisiatif Mulai Percakapan Duluan (Proactive Engine)
-  void _checkProactive() {
-    if (!autoProactive || isListening || isThinking || isTalking) return;
-    final idleSeconds =
-        DateTime.now().difference(_lastInteractionTime).inSeconds;
-    if (idleSeconds >= 90) {
-      _triggerProactiveGreeting(isInitial: false);
-    }
-  }
-
-  void _triggerProactiveGreeting({required bool isInitial}) {
-    final prompt = isInitial
-        ? "[SYSTEM: Aplikasi baru dibuka pada jam $timeString ($dateString) dengan cuaca $weatherSummary. Sapalah pengguna duluan dengan ramah sesuai personamu!]"
-        : "[SYSTEM: Pengguna sudah diam cukup lama. Mulailah percakapan duluan secara natural! Kamu bisa membahas waktu sekarang ($timeString), cuaca ($weatherSummary), menanyakan kabar, atau mengajak tebak-tebakan seru!]";
-    _askAiBrain(prompt, isSystemTrigger: true);
-  }
-
-  void _speakWithEmotion(PetEmotion emotion, String text) async {
-    _talkStopTimer?.cancel();
     setState(() {
-      currentEmotion = emotion;
-      statusSubtitle = text;
-      isTalking = true;
+      sessionState = SessionState.standbyWakeWord;
+      currentEmotion = PetEmotion.normal;
+      statusSubtitle = "Standby • Panggil \"Hai $wakePetName\" untuk bicara";
     });
+    _startWakeWordListener();
+  }
 
-    await _tts.stop();
-    await _tts.speak(text);
+  PetEmotion _mapXiaoZhiEmotion(String emo) {
+    switch (emo.toLowerCase()) {
+      case 'happy':
+      case 'laughing':
+      case 'funny':
+        return PetEmotion.happy;
+      case 'loving':
+      case 'kissy':
+        return PetEmotion.love;
+      case 'confident':
+      case 'cool':
+      case 'delicious':
+        return PetEmotion.excited;
+      case 'winking':
+      case 'silly':
+        return PetEmotion.wink;
+      case 'sad':
+        return PetEmotion.sad;
+      case 'crying':
+        return PetEmotion.crying;
+      case 'angry':
+        return PetEmotion.angry;
+      case 'surprised':
+      case 'shocked':
+        return PetEmotion.surprised;
+      case 'thinking':
+      case 'confused':
+        return PetEmotion.thinking;
+      case 'sleepy':
+      case 'relaxed':
+        return PetEmotion.sleepy;
+      default:
+        return PetEmotion.normal;
+    }
+  }
 
-    // Fallback timer untuk animasi mulut jika TTS selesai
-    int durationMs = (text.length * 75).clamp(1500, 9000);
-    _talkStopTimer = Timer(Duration(milliseconds: durationMs), () {
-      if (mounted) setState(() => isTalking = false);
-    });
+  // =======================================================================
+  // 4. CUACA HUD, SENSOR GOYANG, & INTERAKSI WAJAH
+  // =======================================================================
+  Future<void> _fetchWeatherHud() async {
+    try {
+      double lat = -6.2088;
+      double lon = 106.8456;
+      String city = "Indonesia";
+
+      final geoRes = await http
+          .get(Uri.parse("http://ip-api.com/json"))
+          .timeout(const Duration(seconds: 5));
+      if (geoRes.statusCode == 200) {
+        final g = jsonDecode(geoRes.body);
+        lat = (g['lat'] as num?)?.toDouble() ?? lat;
+        lon = (g['lon'] as num?)?.toDouble() ?? lon;
+        city = g['city'] ?? city;
+      }
+
+      final wRes = await http
+          .get(Uri.parse(
+              "https://api.open-meteo.com/v1/forecast?latitude=$lat&longitude=$lon&current_weather=true"))
+          .timeout(const Duration(seconds: 5));
+      if (wRes.statusCode == 200) {
+        final w = jsonDecode(wRes.body)['current_weather'];
+        if (mounted) {
+          setState(() => weatherSummary = "${w['temperature']}°C • $city");
+        }
+      }
+    } catch (_) {
+      if (mounted) setState(() => weatherSummary = "XiaoZhi Online");
+    }
   }
 
   void _initShakeDetector() {
@@ -708,13 +795,10 @@ Contoh balasan:
           sqrt(event.x * event.x + event.y * event.y + event.z * event.z);
       if (gForce > 22.0) {
         final now = DateTime.now();
-        if (now.difference(_lastShakeTime).inSeconds > 4) {
+        if (now.difference(_lastShakeTime).inSeconds > 3) {
           _lastShakeTime = now;
+          setState(() => currentEmotion = PetEmotion.dizzy);
           _spawnParticle("💫", Colors.yellowAccent);
-          _askAiBrain(
-            "[SYSTEM: Pengguna baru saja menggoyangkan HP dengan kencang sampai kamu pusing! Bereaksilah dengan ekspresi [dizzy]!]",
-            isSystemTrigger: true,
-          );
         }
       }
     });
@@ -743,18 +827,12 @@ Contoh balasan:
     if (rand.nextBool()) {
       setState(() {
         gazeOffset = Offset(
-          (rand.nextDouble() - 0.5) * 0.5,
-          (rand.nextDouble() - 0.5) * 0.3,
+          (rand.nextDouble() - 0.5) * 0.45,
+          (rand.nextDouble() - 0.5) * 0.25,
         );
       });
     } else {
       setState(() => gazeOffset = Offset.zero);
-    }
-
-    if (currentEmotion == PetEmotion.sleepy) {
-      _spawnParticle("Zzz", Colors.cyanAccent);
-    } else if (currentEmotion == PetEmotion.crying) {
-      _spawnParticle("💧", Colors.lightBlueAccent);
     }
   }
 
@@ -800,7 +878,6 @@ Contoh balasan:
   }
 
   void _onFaceTapDown(TapDownDetails details, Size faceAreaSize) {
-    _lastInteractionTime = DateTime.now();
     final local = details.localPosition;
     final centerX = faceAreaSize.width / 2;
     final centerY = faceAreaSize.height / 2;
@@ -810,20 +887,21 @@ Contoh balasan:
 
     if ((local - leftEyeCenter).distance < 45 ||
         (local - rightEyeCenter).distance < 45) {
+      setState(() => currentEmotion = PetEmotion.angry);
       _spawnParticle("💢", Colors.redAccent);
-      _speakWithEmotion(
-        PetEmotion.angry,
-        "Aduh! Jangan colok mataku dong, perih tau!",
-      );
       return;
     }
 
-    _spawnParticle("✨", Colors.cyanAccent);
-    _triggerProactiveGreeting(isInitial: false);
+    // Jika sedang dalam sesi obrolan aktif, ketuk wajah untuk kembali ke Standby
+    if (sessionState != SessionState.standbyWakeWord) {
+      _returnToStandbyMode();
+    } else {
+      // Jika sedang standby, ketuk wajah juga bisa membangunkan XiaoZhi
+      _triggerWakeUpToXiaoZhi("Halo $wakePetName");
+    }
   }
 
   void _onFacePanUpdate(DragUpdateDetails details, Size faceAreaSize) {
-    _lastInteractionTime = DateTime.now();
     final local = details.localPosition;
     final dx = ((local.dx / faceAreaSize.width) - 0.5) * 2.0;
     final dy = ((local.dy / faceAreaSize.height) - 0.5) * 2.0;
@@ -836,12 +914,7 @@ Contoh balasan:
       rubCounter++;
       if (rubCounter % 14 == 0) {
         _spawnParticle("❤️", Colors.pinkAccent);
-        if (currentEmotion != PetEmotion.love) {
-          _speakWithEmotion(
-            PetEmotion.love,
-            "Hehe, nyaman banget dielus-elus sama kamu!",
-          );
-        }
+        setState(() => currentEmotion = PetEmotion.love);
       }
     }
   }
@@ -861,11 +934,12 @@ Contoh balasan:
     _clockTimer?.cancel();
     _idleTimer?.cancel();
     _particleTimer?.cancel();
-    _proactiveTimer?.cancel();
-    _talkStopTimer?.cancel();
+    _wakeRestartTimer?.cancel();
     _accelSub?.cancel();
-    _xiaozhiWs?.close();
-    _tts.stop();
+    _micStreamSub?.cancel();
+    _micRecorder.dispose();
+    _cameraController?.dispose();
+    _ws?.close();
     super.dispose();
   }
 
@@ -879,282 +953,268 @@ Contoh balasan:
 
     return Scaffold(
       body: SafeArea(
-        child: Column(
+        child: Stack(
           children: [
-            // HUD Bar Atas (Nama, Cuaca, Jam, Tombol Pairing & Settings)
-            Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-              child: Row(
-                mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                children: [
-                  Row(
+            Column(
+              children: [
+                // HUD Bar Atas (Status XiaoZhi, Jam/Cuaca, Kamera Vision, Pairing)
+                Padding(
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+                  child: Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
                     children: [
-                      IconButton(
-                        icon: Icon(
-                          isLandscape
-                              ? Icons.stay_current_portrait
-                              : Icons.stay_current_landscape,
-                          color: Colors.white70,
-                          size: 20,
-                        ),
-                        onPressed: _toggleOrientation,
+                      Row(
+                        children: [
+                          IconButton(
+                            icon: Icon(
+                              isLandscape
+                                  ? Icons.stay_current_portrait
+                                  : Icons.stay_current_landscape,
+                              color: Colors.white70,
+                              size: 20,
+                            ),
+                            onPressed: _toggleOrientation,
+                          ),
+                          Container(
+                            width: 10,
+                            height: 10,
+                            decoration: BoxDecoration(
+                              color: isXiaoZhiConnected
+                                  ? Colors.greenAccent
+                                  : Colors.redAccent,
+                              shape: BoxShape.circle,
+                              boxShadow: [
+                                BoxShadow(
+                                  color: isXiaoZhiConnected
+                                      ? Colors.greenAccent
+                                      : Colors.redAccent,
+                                  blurRadius: 6,
+                                )
+                              ],
+                            ),
+                          ),
+                          const SizedBox(width: 8),
+                          Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(
+                                "HAI ${wakePetName.toUpperCase()}",
+                                style: TextStyle(
+                                  fontSize: 13,
+                                  fontWeight: FontWeight.bold,
+                                  letterSpacing: 1.1,
+                                  color: baseColor,
+                                ),
+                              ),
+                              Text(
+                                weatherSummary,
+                                style: const TextStyle(
+                                  fontSize: 10,
+                                  color: Colors.white60,
+                                ),
+                              ),
+                            ],
+                          ),
+                        ],
                       ),
-                      Container(
-                        width: 10,
-                        height: 10,
-                        decoration: BoxDecoration(
-                          color: isXiaoZhiConnected
-                              ? Colors.greenAccent
-                              : baseColor,
-                          shape: BoxShape.circle,
-                          boxShadow: [
-                            BoxShadow(color: baseColor, blurRadius: 6)
-                          ],
-                        ),
-                      ),
-                      const SizedBox(width: 8),
                       Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
                           Text(
-                            petName.toUpperCase(),
-                            style: TextStyle(
-                              fontSize: 15,
+                            timeString,
+                            style: const TextStyle(
+                              fontSize: 18,
                               fontWeight: FontWeight.bold,
-                              letterSpacing: 1.2,
-                              color: baseColor,
+                              color: Colors.white,
                             ),
                           ),
                           Text(
-                            weatherSummary,
+                            dateString,
                             style: const TextStyle(
                               fontSize: 10,
-                              color: Colors.white60,
+                              color: Colors.white54,
                             ),
+                          ),
+                        ],
+                      ),
+                      Row(
+                        children: [
+                          IconButton(
+                            icon: Icon(
+                              showCameraPreview
+                                  ? Icons.videocam
+                                  : Icons.videocam_off,
+                              color: showCameraPreview
+                                  ? Colors.greenAccent
+                                  : Colors.white54,
+                            ),
+                            tooltip: "Intip Kamera Vision",
+                            onPressed: () {
+                              setState(
+                                  () => showCameraPreview = !showCameraPreview);
+                            },
+                          ),
+                          IconButton(
+                            icon: const Icon(Icons.qr_code_2,
+                                color: Colors.cyanAccent),
+                            tooltip: "Cek Kode Pairing XiaoZhi",
+                            onPressed: () => _syncXiaoZhiOtaAndConnect(
+                                showDialogIfPaired: true),
+                          ),
+                          IconButton(
+                            icon: const Icon(Icons.tune, color: Colors.white70),
+                            tooltip: "Atur Wake Word & Warna",
+                            onPressed: _showWakeSettingsDialog,
                           ),
                         ],
                       ),
                     ],
                   ),
-                  Column(
-                    children: [
-                      Text(
-                        timeString,
-                        style: const TextStyle(
-                          fontSize: 18,
-                          fontWeight: FontWeight.bold,
-                          color: Colors.white,
+                ),
+
+                // Area Wajah Robot Ekspresif
+                Expanded(
+                  child: LayoutBuilder(
+                    builder: (context, constraints) {
+                      final size =
+                          Size(constraints.maxWidth, constraints.maxHeight);
+                      return GestureDetector(
+                        behavior: HitTestBehavior.opaque,
+                        onTapDown: (d) => _onFaceTapDown(d, size),
+                        onPanUpdate: (d) => _onFacePanUpdate(d, size),
+                        onPanEnd: _onFacePanEnd,
+                        child: Stack(
+                          alignment: Alignment.center,
+                          children: [
+                            AnimatedBuilder(
+                              animation: Listenable.merge([
+                                _blinkController,
+                                _floatController,
+                                _talkController,
+                              ]),
+                              builder: (context, child) {
+                                return Transform.translate(
+                                  offset: Offset(
+                                    gazeOffset.dx * 12,
+                                    (_floatController.value - 0.5) * 14 +
+                                        gazeOffset.dy * 8,
+                                  ),
+                                  child: CustomPaint(
+                                    size: const Size(320, 220),
+                                    painter: RobotFacePainter(
+                                      emotion: currentEmotion,
+                                      blinkValue: _blinkController.value,
+                                      talkValue: sessionState ==
+                                              SessionState.speakingTts
+                                          ? _talkController.value
+                                          : 0.0,
+                                      gazeOffset: gazeOffset,
+                                      faceColor: baseColor,
+                                    ),
+                                  ),
+                                );
+                              },
+                            ),
+                            ...particles.map(
+                              (p) => Positioned(
+                                left: (size.width / 2 - 160) + p.position.dx,
+                                top: (size.height / 2 - 110) + p.position.dy,
+                                child: Opacity(
+                                  opacity: p.opacity.clamp(0.0, 1.0),
+                                  child: Text(
+                                    p.symbol,
+                                    style: TextStyle(
+                                      fontSize: p.size,
+                                      color: p.color,
+                                      fontWeight: FontWeight.bold,
+                                    ),
+                                  ),
+                                ),
+                              ),
+                            ),
+                          ],
                         ),
-                      ),
-                      Text(
-                        dateString,
-                        style: const TextStyle(
-                          fontSize: 10,
-                          color: Colors.white54,
-                        ),
-                      ),
-                    ],
+                      );
+                    },
                   ),
-                  Row(
-                    children: [
-                      IconButton(
-                        icon: const Icon(Icons.qr_code_2,
-                            color: Colors.cyanAccent),
-                        tooltip: "Pairing XiaoZhi 6-Digit",
-                        onPressed: _checkXiaoZhiOtaPairing,
+                ),
+
+                // Indikator Status Hands-Free & Subtitle XiaoZhi (Tanpa Tombol Mic)
+                Padding(
+                  padding:
+                      const EdgeInsets.only(bottom: 22, left: 24, right: 24),
+                  child: Container(
+                    width: double.infinity,
+                    padding: const EdgeInsets.symmetric(
+                        horizontal: 20, vertical: 14),
+                    decoration: BoxDecoration(
+                      color: Colors.white.withOpacity(0.07),
+                      borderRadius: BorderRadius.circular(22),
+                      border: Border.all(
+                        color: sessionState == SessionState.listeningToUser
+                            ? Colors.greenAccent
+                            : sessionState == SessionState.speakingTts
+                                ? Colors.cyanAccent
+                                : Colors.white24,
+                        width: sessionState == SessionState.standbyWakeWord
+                            ? 1
+                            : 2,
                       ),
-                      IconButton(
-                        icon: const Icon(Icons.settings, color: Colors.white70),
-                        onPressed: _showSettingsDialog,
-                      ),
-                    ],
+                    ),
+                    child: Text(
+                      statusSubtitle,
+                      textAlign: TextAlign.center,
+                      style: const TextStyle(fontSize: 14, color: Colors.white),
+                    ),
                   ),
-                ],
-              ),
+                ),
+              ],
             ),
 
-            // Area Wajah Robot Interaktif
-            Expanded(
-              child: LayoutBuilder(
-                builder: (context, constraints) {
-                  final size =
-                      Size(constraints.maxWidth, constraints.maxHeight);
-                  return GestureDetector(
-                    behavior: HitTestBehavior.opaque,
-                    onTapDown: (d) => _onFaceTapDown(d, size),
-                    onPanUpdate: (d) => _onFacePanUpdate(d, size),
-                    onPanEnd: _onFacePanEnd,
+            // Jendela Kecil Preview Kamera Vision (Jika Diaktifkan)
+            if (showCameraPreview &&
+                _cameraController != null &&
+                _cameraController!.value.isInitialized)
+              Positioned(
+                right: 16,
+                bottom: 90,
+                child: GestureDetector(
+                  onTap: _switchCameraLens,
+                  child: Container(
+                    width: 110,
+                    height: 150,
+                    decoration: BoxDecoration(
+                      borderRadius: BorderRadius.circular(16),
+                      border: Border.all(color: baseColor, width: 2),
+                    ),
+                    clipBehavior: Clip.antiAlias,
                     child: Stack(
-                      alignment: Alignment.center,
+                      fit: StackFit.expand,
                       children: [
-                        AnimatedBuilder(
-                          animation: Listenable.merge([
-                            _blinkController,
-                            _floatController,
-                            _talkController,
-                          ]),
-                          builder: (context, child) {
-                            return Transform.translate(
-                              offset: Offset(
-                                gazeOffset.dx * 12,
-                                (_floatController.value - 0.5) * 14 +
-                                    gazeOffset.dy * 8,
-                              ),
-                              child: CustomPaint(
-                                size: const Size(320, 210),
-                                painter: RobotFacePainter(
-                                  emotion: currentEmotion,
-                                  blinkValue: _blinkController.value,
-                                  talkValue:
-                                      isTalking ? _talkController.value : 0.0,
-                                  gazeOffset: gazeOffset,
-                                  faceColor: baseColor,
-                                ),
-                              ),
-                            );
-                          },
-                        ),
-                        ...particles.map(
-                          (p) => Positioned(
-                            left: (size.width / 2 - 160) + p.position.dx,
-                            top: (size.height / 2 - 105) + p.position.dy,
-                            child: Opacity(
-                              opacity: p.opacity.clamp(0.0, 1.0),
-                              child: Text(
-                                p.symbol,
-                                style: TextStyle(
-                                  fontSize: p.size,
-                                  color: p.color,
-                                  fontWeight: FontWeight.bold,
-                                ),
-                              ),
+                        CameraPreview(_cameraController!),
+                        Positioned(
+                          bottom: 4,
+                          right: 4,
+                          child: Container(
+                            padding: const EdgeInsets.all(4),
+                            decoration: const BoxDecoration(
+                              color: Colors.black54,
+                              shape: BoxShape.circle,
+                            ),
+                            child: const Icon(
+                              Icons.cameraswitch,
+                              size: 16,
+                              color: Colors.white,
                             ),
                           ),
                         ),
                       ],
                     ),
-                  );
-                },
-              ),
-            ),
-
-            // Kotak Subtitle Obrolan AI
-            Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 6),
-              child: Container(
-                width: double.infinity,
-                padding:
-                    const EdgeInsets.symmetric(horizontal: 18, vertical: 12),
-                decoration: BoxDecoration(
-                  color: Colors.white.withOpacity(0.07),
-                  borderRadius: BorderRadius.circular(20),
-                  border: Border.all(
-                    color: isListening
-                        ? Colors.redAccent
-                        : baseColor.withOpacity(0.35),
-                    width: isListening ? 2 : 1,
                   ),
                 ),
-                child: Text(
-                  statusSubtitle,
-                  textAlign: TextAlign.center,
-                  style: const TextStyle(fontSize: 14, color: Colors.white),
-                ),
               ),
-            ),
-
-            // Panel Kontrol Suara, Ketik Pesan, & Sapa Duluan
-            Padding(
-              padding: const EdgeInsets.only(bottom: 14, left: 20, right: 20, top: 4),
-              child: Row(
-                mainAxisAlignment: MainAxisAlignment.center,
-                children: [
-                  // Tombol Ketik Teks
-                  IconButton.filledTonal(
-                    onPressed: _showTextInputDialog,
-                    icon: const Icon(Icons.keyboard),
-                    tooltip: "Ketik Pesan",
-                  ),
-                  const SizedBox(width: 18),
-
-                  // Tombol Utama Mikrofon (Bicara)
-                  GestureDetector(
-                    onTap: _toggleListening,
-                    child: AnimatedContainer(
-                      duration: const Duration(milliseconds: 200),
-                      width: isListening ? 72 : 64,
-                      height: isListening ? 72 : 64,
-                      decoration: BoxDecoration(
-                        color: isListening ? Colors.redAccent : baseColor,
-                        shape: BoxShape.circle,
-                        boxShadow: [
-                          BoxShadow(
-                            color: (isListening ? Colors.redAccent : baseColor)
-                                .withOpacity(0.5),
-                            blurRadius: 16,
-                            spreadRadius: 2,
-                          )
-                        ],
-                      ),
-                      child: Icon(
-                        isListening ? Icons.mic : Icons.mic_none,
-                        color: Colors.black,
-                        size: 32,
-                      ),
-                    ),
-                  ),
-                  const SizedBox(width: 18),
-
-                  // Tombol Pancing Pet Ngobrol Duluan
-                  IconButton.filledTonal(
-                    onPressed: () =>
-                        _triggerProactiveGreeting(isInitial: false),
-                    icon: const Icon(Icons.bolt, color: Colors.amberAccent),
-                    tooltip: "Minta Pet Mulai Ngobrol",
-                  ),
-                ],
-              ),
-            ),
           ],
         ),
-      ),
-    );
-  }
-
-  void _showTextInputDialog() {
-    final textCtrl = TextEditingController();
-    showDialog(
-      context: context,
-      builder: (context) => AlertDialog(
-        title: Text("Ngobrol dengan $petName"),
-        content: TextField(
-          controller: textCtrl,
-          autofocus: true,
-          decoration: const InputDecoration(
-            hintText: "Ketik pertanyaan atau ajak ngobrol...",
-          ),
-          onSubmitted: (val) {
-            if (val.trim().isNotEmpty) {
-              Navigator.pop(context);
-              _askAiBrain(val.trim());
-            }
-          },
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context),
-            child: const Text("Batal"),
-          ),
-          ElevatedButton(
-            onPressed: () {
-              if (textCtrl.text.trim().isNotEmpty) {
-                Navigator.pop(context);
-                _askAiBrain(textCtrl.text.trim());
-              }
-            },
-            child: const Text("Kirim"),
-          ),
-        ],
       ),
     );
   }
@@ -1192,127 +1252,70 @@ Contoh balasan:
             ),
             const SizedBox(height: 12),
             Text(
-              "MAC Address Virtual:\n$deviceMac",
-              textAlign: TextAlign.center,
+              "Device MAC: $deviceMac",
               style: const TextStyle(fontSize: 11, color: Colors.white54),
             ),
-            if (serverMsg != null) ...[
-              const SizedBox(height: 8),
-              Text(
-                serverMsg,
-                textAlign: TextAlign.center,
-                style: const TextStyle(fontSize: 11, color: Colors.amberAccent),
-              ),
-            ],
           ],
         ),
         actions: [
           ElevatedButton(
-            onPressed: () => Navigator.pop(context),
-            child: const Text("Selesai"),
+            onPressed: () {
+              Navigator.pop(context);
+              _syncXiaoZhiOtaAndConnect();
+            },
+            child: const Text("Sudah Saya Pairing, Hubungkan!"),
           ),
         ],
       ),
     );
   }
 
-  void _showSettingsDialog() {
-    final nameCtrl = TextEditingController(text: petName);
-    final personaCtrl = TextEditingController(text: petPersona);
-    final urlCtrl = TextEditingController(text: xiaozhiUrl);
-    final keyCtrl = TextEditingController(text: geminiApiKey);
+  void _showWakeSettingsDialog() {
+    final wakeCtrl = TextEditingController(text: wakePetName);
     int selectedColor = themeColorIndex;
-    String tempLang = selectedLang;
-    bool tempProactive = autoProactive;
 
     showDialog(
       context: context,
       builder: (context) => StatefulBuilder(
         builder: (context, setDialogState) => AlertDialog(
-          title: const Text("Pengaturan AI, Bahasa & Persona"),
-          content: SingleChildScrollView(
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                const Text("Warna Mata Neon:", style: TextStyle(fontSize: 13)),
-                const SizedBox(height: 8),
-                Row(
-                  mainAxisAlignment: MainAxisAlignment.spaceAround,
-                  children: List.generate(themeColors.length, (idx) {
-                    return GestureDetector(
-                      onTap: () => setDialogState(() => selectedColor = idx),
-                      child: CircleAvatar(
-                        radius: 16,
-                        backgroundColor: themeColors[idx],
-                        child: selectedColor == idx
-                            ? const Icon(Icons.check,
-                                color: Colors.black, size: 18)
-                            : null,
-                      ),
-                    );
-                  }),
+          title: const Text("Wake Word & Tampilan"),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text("Warna Mata Neon:", style: TextStyle(fontSize: 13)),
+              const SizedBox(height: 10),
+              Row(
+                mainAxisAlignment: MainAxisAlignment.spaceAround,
+                children: List.generate(themeColors.length, (idx) {
+                  return GestureDetector(
+                    onTap: () => setDialogState(() => selectedColor = idx),
+                    child: CircleAvatar(
+                      radius: 16,
+                      backgroundColor: themeColors[idx],
+                      child: selectedColor == idx
+                          ? const Icon(Icons.check,
+                              color: Colors.black, size: 18)
+                          : null,
+                    ),
+                  );
+                }),
+              ),
+              const SizedBox(height: 18),
+              TextField(
+                controller: wakeCtrl,
+                decoration: const InputDecoration(
+                  labelText: "Nama Panggilan (Sesuai Web XiaoZhi)",
+                  helperText:
+                      "Panggil dengan: \"Hai / Halo / Hello [Nama ini]\"",
                 ),
-                const SizedBox(height: 16),
-                DropdownButtonFormField<String>(
-                  value: tempLang,
-                  decoration: const InputDecoration(
-                    labelText: "Bahasa Respon & Suara AI",
-                  ),
-                  items: languageOptions.entries
-                      .map((e) => DropdownMenuItem(
-                            value: e.key,
-                            child: Text(e.value,
-                                style: const TextStyle(fontSize: 13)),
-                          ))
-                      .toList(),
-                  onChanged: (val) {
-                    if (val != null) setDialogState(() => tempLang = val);
-                  },
-                ),
-                const SizedBox(height: 10),
-                TextField(
-                  controller: nameCtrl,
-                  decoration: const InputDecoration(labelText: "Nama Pet"),
-                ),
-                const SizedBox(height: 10),
-                TextField(
-                  controller: personaCtrl,
-                  maxLines: 2,
-                  decoration:
-                      const InputDecoration(labelText: "Sifat / Persona"),
-                ),
-                const SizedBox(height: 10),
-                SwitchListTile(
-                  contentPadding: EdgeInsets.zero,
-                  title: const Text("Inisiatif Ngobrol Duluan",
-                      style: TextStyle(fontSize: 13)),
-                  subtitle: const Text("Pet menyapa otomatis saat kamu diam",
-                      style: TextStyle(fontSize: 11)),
-                  value: tempProactive,
-                  onChanged: (v) => setDialogState(() => tempProactive = v),
-                ),
-                const Divider(),
-                Text(
-                  "Device MAC (XiaoZhi): $deviceMac",
-                  style: const TextStyle(fontSize: 11, color: Colors.cyanAccent),
-                ),
-                const SizedBox(height: 6),
-                TextField(
-                  controller: urlCtrl,
-                  decoration:
-                      const InputDecoration(labelText: "XiaoZhi Server WS"),
-                ),
-                const SizedBox(height: 10),
-                TextField(
-                  controller: keyCtrl,
-                  obscureText: true,
-                  decoration: const InputDecoration(
-                    labelText: "Gemini API Key (Opsional)",
-                  ),
-                ),
-              ],
-            ),
+              ),
+              const SizedBox(height: 12),
+              Text(
+                "MAC Address: $deviceMac",
+                style: const TextStyle(fontSize: 11, color: Colors.white54),
+              ),
+            ],
           ),
           actions: [
             TextButton(
@@ -1320,17 +1323,22 @@ Contoh balasan:
               child: const Text("Batal"),
             ),
             ElevatedButton(
-              onPressed: () {
-                _saveSettings(
-                  name: nameCtrl.text,
-                  persona: personaCtrl.text,
-                  lang: tempLang,
-                  url: urlCtrl.text,
-                  apiKey: keyCtrl.text,
-                  colorIdx: selectedColor,
-                  proactive: tempProactive,
-                );
-                Navigator.pop(context);
+              onPressed: () async {
+                final prefs = await SharedPreferences.getInstance();
+                final newWake = wakeCtrl.text.trim().isEmpty
+                    ? "xiaozhi"
+                    : wakeCtrl.text.trim();
+                await prefs.setString('wakePetName', newWake);
+                await prefs.setInt('themeColorIndex', selectedColor);
+                setState(() {
+                  wakePetName = newWake;
+                  themeColorIndex = selectedColor;
+                  if (sessionState == SessionState.standbyWakeWord) {
+                    statusSubtitle =
+                        "Standby • Panggil \"Hai $wakePetName\" untuk bicara";
+                  }
+                });
+                if (context.mounted) Navigator.pop(context);
               },
               child: const Text("Simpan"),
             ),
@@ -1493,7 +1501,7 @@ class RobotFacePainter extends CustomPainter {
       } else {
         path.moveTo(center.dx - w, center.dy - h);
         path.lineTo(center.dx + w, center.dy - h);
-        path.lineTo(center.dx + w, center.dy - 5);
+        path.lineTo(center.dx - w, center.dy - 5);
         path.lineTo(center.dx - w, center.dy - h * 0.55);
       }
       path.close();
