@@ -39,7 +39,7 @@ jobs:
           cp /tmp/backup/pubspec.yaml .
           cp -r /tmp/backup/lib/* lib/
 
-      - name: Configure Android Manifest & SDK 35
+      - name: Configure Android Manifest, SDK 35 & Root Gradle Patch
         run: |
           python3 -c '
           manifest_path = "android/app/src/main/AndroidManifest.xml"
@@ -63,43 +63,33 @@ jobs:
           with open(gradle_path, "r") as f:
               g = f.read()
           g = g.replace("flutter.minSdkVersion", "23")
-          g = g.replace("flutter.compileSdkVersion", "35")
-          g = g.replace("flutter.targetSdkVersion", "35")
-          if "compileSdk =" not in g:
-              g = g.replace("android {", "android {\n    compileSdk = 35")
           with open(gradle_path, "w") as f:
               f.write(g)
-          '
 
-      - name: Fetch Dependencies
-        run: flutter pub get
-
-      - name: Patch Pub Cache for Plugin Compatibility (SDK 35)
-        run: |
-          python3 -c '
-          import os
-          pub_cache = os.path.expanduser("~/.pub-cache")
-          for root, dirs, files in os.walk(pub_cache):
-              for file in files:
-                  if file == "build.gradle":
-                      path = os.path.join(root, file)
-                      try:
-                          with open(path, "r") as f:
-                              content = f.read()
-                          if "flutter." in content or "compileSdkVersion" in content:
-                              new_content = content
-                              new_content = new_content.replace("compileSdkVersion flutter.compileSdkVersion", "compileSdkVersion 35")
-                              new_content = new_content.replace("targetSdkVersion flutter.targetSdkVersion", "targetSdkVersion 35")
-                              new_content = new_content.replace("minSdkVersion flutter.minSdkVersion", "minSdkVersion 23")
-                              new_content = new_content.replace("flutter.compileSdkVersion", "35")
-                              new_content = new_content.replace("flutter.targetSdkVersion", "35")
-                              new_content = new_content.replace("flutter.minSdkVersion", "23")
-                              if new_content != content:
-                                  with open(path, "w") as f:
-                                      f.write(new_content)
-                                  print(f"Patched: {path}")
-                      except Exception:
-                          pass
+          root_gradle = "android/build.gradle"
+          with open(root_gradle, "r") as f:
+              rg = f.read()
+          if "subprojects {" not in rg:
+              rg += """
+          subprojects {
+              afterEvaluate { project ->
+                  if (project.hasProperty(\x27android\x27)) {
+                      project.android {
+                          if (namespace == null) {
+                              namespace project.group
+                          }
+                          compileSdk = 35
+                          defaultConfig {
+                              minSdk = 23
+                              targetSdk = 35
+                          }
+                      }
+                  }
+              }
+          }
+          """
+              with open(root_gradle, "w") as f:
+                  f.write(rg)
           '
 
       - name: Build Release APK
