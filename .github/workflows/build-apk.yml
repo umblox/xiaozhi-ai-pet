@@ -39,7 +39,7 @@ jobs:
           cp /tmp/backup/pubspec.yaml .
           cp -r /tmp/backup/lib/* lib/
 
-      - name: Configure Android SDK & Permissions
+      - name: Configure Android Manifest & Gradle Compatibility
         run: |
           python3 -c '
           manifest_path = "android/app/src/main/AndroidManifest.xml"
@@ -62,7 +62,12 @@ jobs:
           gradle_path = "android/app/build.gradle"
           with open(gradle_path, "r") as f:
               g = f.read()
-          g = g.replace("flutter.minSdkVersion", "24")
+          g = g.replace("flutter.minSdkVersion", "23")
+          # Tambahkan kompatibilitas compileSdkVersion untuk plugin record_android
+          if "compileSdkVersion" not in g:
+              g = g.replace("defaultConfig {", "compileSdkVersion 34\n    defaultConfig {")
+          if "targetSdkVersion" not in g:
+              g = g.replace("targetSdkVersion flutter.targetSdkVersion", "targetSdkVersion 34")
           with open(gradle_path, "w") as f:
               f.write(g)
           '
