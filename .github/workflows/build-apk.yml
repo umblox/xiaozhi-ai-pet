@@ -39,7 +39,7 @@ jobs:
           cp /tmp/backup/pubspec.yaml .
           cp -r /tmp/backup/lib/* lib/
 
-      - name: Inject Android Permissions (Camera, Mic, Internet)
+      - name: Configure Android SDK & Permissions
         run: |
           python3 -c '
           manifest_path = "android/app/src/main/AndroidManifest.xml"
@@ -58,6 +58,13 @@ jobs:
           content = content.replace("android:label=\"xiaozhi_pet\"", "android:label=\"XiaoZhi AI Pet\"")
           with open(manifest_path, "w") as f:
               f.write(content)
+
+          gradle_path = "android/app/build.gradle"
+          with open(gradle_path, "r") as f:
+              g = f.read()
+          g = g.replace("flutter.minSdkVersion", "24")
+          with open(gradle_path, "w") as f:
+              f.write(g)
           '
 
       - name: Build Release APK
@@ -76,7 +83,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: latest-build
-          name: "XiaoZhi AI Pet - APK Terbaru"
-          body: "Download langsung file **xiaozhi-ai-pet.apk** di bawah ini untuk install di HP Android."
+          name: "XiaoZhi AI Pet - Full Native Edition"
+          body: "Download langsung file **xiaozhi-ai-pet.apk** (100% Native XiaoZhi Audio + Vision + Wake Word)."
           files: xiaozhi-ai-pet.apk
           prerelease: false
