@@ -39,7 +39,7 @@ jobs:
           cp /tmp/backup/pubspec.yaml .
           cp -r /tmp/backup/lib/* lib/
 
-      - name: Configure Android Manifest & Gradle Compatibility
+      - name: Configure Android Manifest, SDK & Subprojects Gradle Fix
         run: |
           python3 -c '
           manifest_path = "android/app/src/main/AndroidManifest.xml"
@@ -63,13 +63,33 @@ jobs:
           with open(gradle_path, "r") as f:
               g = f.read()
           g = g.replace("flutter.minSdkVersion", "23")
-          # Tambahkan kompatibilitas compileSdkVersion untuk plugin record_android
-          if "compileSdkVersion" not in g:
-              g = g.replace("defaultConfig {", "compileSdkVersion 34\n    defaultConfig {")
-          if "targetSdkVersion" not in g:
-              g = g.replace("targetSdkVersion flutter.targetSdkVersion", "targetSdkVersion 34")
           with open(gradle_path, "w") as f:
               f.write(g)
+
+          root_gradle = "android/build.gradle"
+          with open(root_gradle, "r") as f:
+              rg = f.read()
+          if "subprojects {" not in rg:
+              rg += """
+          subprojects {
+              afterEvaluate { project ->
+                  if (project.hasProperty(\x27android\x27)) {
+                      project.android {
+                          if (namespace == null) {
+                              namespace project.group
+                          }
+                          compileSdkVersion 34
+                          defaultConfig {
+                              minSdkVersion 23
+                              targetSdkVersion 34
+                          }
+                      }
+                  }
+              }
+          }
+          """
+              with open(root_gradle, "w") as f:
+                  f.write(rg)
           '
 
       - name: Build Release APK
@@ -88,7 +108,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: latest-build
-          name: "XiaoZhi AI Pet - Full Native Edition"
-          body: "Download langsung file **xiaozhi-ai-pet.apk** (100% Native XiaoZhi Audio + Vision + Wake Word)."
+          name: "XiaoZhi AI Pet - Pure XiaoZhi Edition"
+          body: "Download langsung file **xiaozhi-ai-pet.apk** di bawah ini."
           files: xiaozhi-ai-pet.apk
           prerelease: false
