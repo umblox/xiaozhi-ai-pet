@@ -42,22 +42,13 @@ jobs:
       - name: Fetch Dependencies
         run: flutter pub get
 
-      - name: Patch Android SDK 35, NDK & Plugin Pub-Cache
+      - name: Patch Android SDK 35, Native GPS, NDK & Plugin Pub-Cache
         run: |
           python3 - << 'EOF'
           import os
           import re
 
-          # 1. Pastikan kompatibilitas parameter speech_to_text 7.4.0 di lib/main.dart
-          main_dart = "lib/main.dart"
-          if os.path.exists(main_dart):
-              with open(main_dart, "r") as f:
-                  code = f.read()
-              code = code.replace("partialResults: true,", "").replace("cancelOnError: false,", "")
-              with open(main_dart, "w") as f:
-                  f.write(code)
-
-          # 2. Suntikkan Permission ke AndroidManifest.xml utama
+          # 1. Suntikkan Permission GPS, Kamera, Mic ke AndroidManifest.xml
           manifest_path = "android/app/src/main/AndroidManifest.xml"
           with open(manifest_path, "r") as f:
               content = f.read()
@@ -65,6 +56,8 @@ jobs:
               <uses-permission android:name="android.permission.INTERNET"/>
               <uses-permission android:name="android.permission.RECORD_AUDIO"/>
               <uses-permission android:name="android.permission.CAMERA"/>
+              <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION"/>
+              <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION"/>
               <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS"/>
               <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>
               <uses-permission android:name="android.permission.WAKE_LOCK"/>
@@ -74,6 +67,111 @@ jobs:
           content = content.replace('android:label="xiaozhi_pet"', 'android:label="XiaoZhi AI Pet"')
           with open(manifest_path, "w") as f:
               f.write(content)
+
+          # 2. Suntikkan Native Hardware GPS & Audio Volume ke MainActivity.kt
+          for root, dirs, files in os.walk("android/app/src/main/kotlin"):
+              if "MainActivity.kt" in files:
+                  kt_path = os.path.join(root, "MainActivity.kt")
+                  with open(kt_path, "r") as f:
+                      first_line = f.readline().strip()
+                  kt_code = f"""{first_line}
+
+          import android.Manifest
+          import android.content.Context
+          import android.content.pm.PackageManager
+          import android.location.Location
+          import android.location.LocationListener
+          import android.location.LocationManager
+          import android.media.AudioManager
+          import android.os.Build
+          import android.os.Bundle
+          import android.os.Handler
+          import android.os.Looper
+          import io.flutter.embedding.android.FlutterActivity
+          import io.flutter.embedding.engine.FlutterEngine
+          import io.flutter.plugin.common.MethodChannel
+
+          class MainActivity: FlutterActivity() {{
+              private val CHANNEL = "id.xiaozhi.aipet/native"
+
+              override fun configureFlutterEngine(flutterEngine: FlutterEngine) {{
+                  super.configureFlutterEngine(flutterEngine)
+                  MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL).setMethodCallHandler {{ call, result ->
+                      when (call.method) {{
+                          "getGps" -> getGpsCoordinates(result)
+                          "setVolume" -> {{
+                              val level = call.argument<Int>("level") ?: 80
+                              val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+                              val max = am.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
+                              val target = (level.coerceIn(0, 100) * max) / 100
+                              am.setStreamVolume(AudioManager.STREAM_MUSIC, target, 0)
+                              result.success(level)
+                          }}
+                          "getVolume" -> {{
+                              val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+                              val max = am.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
+                              val cur = am.getStreamVolume(AudioManager.STREAM_MUSIC)
+                              val pct = if (max > 0) (cur * 100) / max else 80
+                              result.success(pct)
+                          }}
+                          else -> result.notImplemented()
+                      }}
+                  }}
+              }}
+
+              private fun getGpsCoordinates(result: MethodChannel.Result) {{
+                  try {{
+                      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {{
+                          if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED &&
+                              checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION) != PackageManager.PERMISSION_GRANTED) {{
+                              requestPermissions(arrayOf(Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION), 101)
+                              result.error("PERM", "Permission requested", null)
+                              return
+                          }}
+                      }}
+                      val lm = getSystemService(Context.LOCATION_SERVICE) as LocationManager
+                      val providers = lm.getProviders(true)
+                      var bestLocation: Location? = null
+                      for (provider in providers) {{
+                          val l = lm.getLastKnownLocation(provider) ?: continue
+                          if (bestLocation == null || l.accuracy < bestLocation.accuracy) {{
+                              bestLocation = l
+                          }}
+                      }}
+                      if (bestLocation != null) {{
+                          result.success(mapOf("lat" to bestLocation.latitude, "lon" to bestLocation.longitude))
+                      }} else {{
+                          val provider = if (lm.isProviderEnabled(LocationManager.GPS_PROVIDER)) LocationManager.GPS_PROVIDER else LocationManager.NETWORK_PROVIDER
+                          var answered = false
+                          val listener = object : LocationListener {{
+                              override fun onLocationChanged(loc: Location) {{
+                                  if (!answered) {{
+                                      answered = true
+                                      lm.removeUpdates(this)
+                                      result.success(mapOf("lat" to loc.latitude, "lon" to loc.longitude))
+                                  }}
+                              }}
+                              override fun onStatusChanged(p: String?, s: Int, e: Bundle?) {{}}
+                              override fun onProviderEnabled(p: String) {{}}
+                              override fun onProviderDisabled(p: String) {{}}
+                          }}
+                          lm.requestLocationUpdates(provider, 0L, 0f, listener, Looper.getMainLooper())
+                          Handler(Looper.getMainLooper()).postDelayed({{
+                              if (!answered) {{
+                                  answered = true
+                                  lm.removeUpdates(listener)
+                                  result.error("TIMEOUT", "GPS timeout", null)
+                              }}
+                          }}, 4500)
+                      }}
+                  }} catch (e: Exception) {{
+                      result.error("ERR", e.message, null)
+                  }}
+              }}
+          }}
+          """
+                  with open(kt_path, "w") as f:
+                      f.write(kt_code)
 
           # 3. Tambahkan toleransi JVM target di gradle.properties
           prop_path = "android/gradle.properties"
@@ -94,25 +192,24 @@ jobs:
           # 5. Tambal seluruh build.gradle & record_linux.dart di ~/.pub-cache
           pub_cache = os.path.expanduser("~/.pub-cache")
           for root, dirs, files in os.walk(pub_cache):
-              # Patch record_linux.dart yang error karena ketidakcocokan versi record_platform_interface
               if "record_linux.dart" in files:
                   rl_path = os.path.join(root, "record_linux.dart")
                   try:
                       with open(rl_path, "r") as f:
                           rl = f.read()
-                      rl = rl.replace(
-                          "class RecordLinux extends RecordPlatform {",
-                          "class RecordLinux extends RecordPlatform {\n  @override\n  dynamic noSuchMethod(Invocation i) => super.noSuchMethod(i);"
-                      )
-                      rl = rl.replace(
-                          "Future<bool> hasPermission(String recorderId)",
-                          "Future<bool> hasPermission(String recorderId, {bool request = true})"
-                      )
-                      with open(rl_path, "w") as f:
-                          f.write(rl)
-                      print(f"Patched Dart file: {rl_path}")
-                  except Exception as e:
-                      print(f"Skip {rl_path}: {e}")
+                      if "noSuchMethod" not in rl:
+                          rl = rl.replace(
+                              "class RecordLinux extends RecordPlatform {",
+                              "class RecordLinux extends RecordPlatform {\n  @override\n  dynamic noSuchMethod(Invocation i) => super.noSuchMethod(i);"
+                          )
+                          rl = rl.replace(
+                              "Future<bool> hasPermission(String recorderId)",
+                              "Future<bool> hasPermission(String recorderId, {bool request = true})"
+                          )
+                          with open(rl_path, "w") as f:
+                              f.write(rl)
+                  except Exception:
+                      pass
 
               if "build.gradle" in files:
                   bg_path = os.path.join(root, "build.gradle")
@@ -141,9 +238,8 @@ jobs:
                       if bg != orig:
                           with open(bg_path, "w") as f:
                               f.write(bg)
-                          print(f"Patched plugin: {bg_path}")
-                  except Exception as e:
-                      print(f"Skip {bg_path}: {e}")
+                  except Exception:
+                      pass
           EOF
 
       - name: Build Release APK
@@ -161,7 +257,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: latest-build
-          name: "XiaoZhi AI Pet - Pure XiaoZhi Edition"
-          body: "Download langsung file **xiaozhi-ai-pet.apk** di bawah ini (100% Opus XiaoZhi Audio + Wake Word + MCP Camera Vision)."
+          name: "XiaoZhi AI Pet - Full GPS, Selfie Vision & 21 Emotions"
+          body: "Download langsung file **xiaozhi-ai-pet.apk** di bawah ini."
           files: xiaozhi-ai-pet.apk
           prerelease: false
