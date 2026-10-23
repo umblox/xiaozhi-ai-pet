@@ -212,7 +212,7 @@ jobs:
           with open(gradle_path, "w") as f:
               f.write(g)
 
-          # 6. Tambal seluruh build.gradle & record_linux.dart di ~/.pub-cache
+          # 6. Tambal seluruh build.gradle & record_linux.dart di ~/.pub-cache secara Idempoten (Anti-Duplikat)
           pub_cache = os.path.expanduser("~/.pub-cache")
           for root, dirs, files in os.walk(pub_cache):
               if "record_linux.dart" in files:
@@ -220,14 +220,22 @@ jobs:
                   try:
                       with open(rl_path, "r") as f:
                           rl = f.read()
+
+                      # Bersihkan duplikat dari cache build sebelumnya
+                      rl = rl.replace("  @override\n  dynamic noSuchMethod(Invocation i) => super.noSuchMethod(i);\n", "")
+                      rl = rl.replace("  dynamic noSuchMethod(Invocation i) => super.noSuchMethod(i);\n", "")
+                      rl = rl.replace("{bool request = true}, {bool request = true}", "{bool request = true}")
+
+                      # Pasang tepat 1 kali
                       rl = rl.replace(
                           "class RecordLinux extends RecordPlatform {",
                           "class RecordLinux extends RecordPlatform {\n  @override\n  dynamic noSuchMethod(Invocation i) => super.noSuchMethod(i);"
                       )
-                      rl = rl.replace(
-                          "Future<bool> hasPermission(String recorderId)",
-                          "Future<bool> hasPermission(String recorderId, {bool request = true})"
-                      )
+                      if "{bool request = true}" not in rl:
+                          rl = rl.replace(
+                              "Future<bool> hasPermission(String recorderId)",
+                              "Future<bool> hasPermission(String recorderId, {bool request = true})"
+                          )
                       with open(rl_path, "w") as f:
                           f.write(rl)
                   except Exception:
