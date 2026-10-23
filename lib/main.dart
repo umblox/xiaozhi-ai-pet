@@ -521,7 +521,6 @@ class _PetHomeScreenState extends State<PetHomeScreen>
   HandGesture _defaultGestureForEmotion(XiaoZhiEmotion emo) {
     switch (emo) {
       case XiaoZhiEmotion.happy:
-      case XiaoZhiEmotion.excited:
         return HandGesture.wave;
       case XiaoZhiEmotion.winking:
       case XiaoZhiEmotion.silly:
