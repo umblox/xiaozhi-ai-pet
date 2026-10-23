@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:collection';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
@@ -8,7 +9,6 @@ import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:sensors_plus/sensors_plus.dart';
-import 'package:speech_to_text/speech_to_text.dart' as stt;
 import 'package:record/record.dart';
 import 'package:flutter_pcm_sound/flutter_pcm_sound.dart';
 import 'package:opus_dart/opus_dart.dart';
@@ -94,7 +94,7 @@ enum MusicianMode {
   vocal,
 }
 
-enum SessionState { standbyWakeWord, listeningToUser, speakingTts }
+enum SessionState { standbyVad, listeningToUser, speakingTts }
 
 class FloatingParticle {
   Offset position;
@@ -124,8 +124,7 @@ class _PetHomeScreenState extends State<PetHomeScreen>
   static const MethodChannel _deviceChannel =
       MethodChannel('id.xiaozhi.aipet/device');
 
-  // Nama Pet Otomatis dari Server XiaoZhi + Warna & SFX
-  String petName = "KIMMI";
+  // Pengaturan Visual & Suara (Tanpa Hardcode Nama)
   int themeColorIndex = 1;
   bool enableRobotSfx = true;
 
@@ -140,18 +139,23 @@ class _PetHomeScreenState extends State<PetHomeScreen>
   bool isXiaoZhiConnected = false;
   WebSocket? _ws;
 
-  // Status Sesi & Audio Opus Native
-  SessionState sessionState = SessionState.standbyWakeWord;
+  // Status Sesi, Smart Audio VAD, & Pre-Roll Opus Buffer
+  SessionState sessionState = SessionState.standbyVad;
   bool isVoiceAudioActive = false;
   Timer? _voiceDecayTimer;
+  DateTime _lastTtsStopTime = DateTime.fromMillisecondsSinceEpoch(0);
+  DateTime _lastUserVoiceTime = DateTime.now();
 
-  final stt.SpeechToText _wakeStt = stt.SpeechToText();
   final AudioRecorder _micRecorder = AudioRecorder();
   StreamSubscription<Uint8List>? _micStreamSub;
   SimpleOpusEncoder? _opusEncoder;
   SimpleOpusDecoder? _opusDecoder;
   final List<int> _pcmMicBuffer = [];
+  final Queue<Uint8List> _preRollOpusBuffer = Queue<Uint8List>();
+  int _vadSpeechFrameCount = 0;
   int _serverSampleRate = 24000;
+  int _savedMusicVolume = 80;
+  bool _isMusicDucked = false;
 
   // Kamera MCP Vision (Selfie & Belakang)
   List<CameraDescription> _cameras = [];
@@ -160,7 +164,7 @@ class _PetHomeScreenState extends State<PetHomeScreen>
   bool showCameraPreview = false;
   bool _isCameraBusy = false;
 
-  // Data GPS Asli & Cuaca Lokal
+  // Data GPS Asli, Waktu Presisi (Subuh/Pagi/Siang/Sore/Malam) & Cuaca Lokal
   double? gpsLat;
   double? gpsLon;
   String locationName = "Mencari GPS...";
@@ -169,6 +173,7 @@ class _PetHomeScreenState extends State<PetHomeScreen>
   String weatherCondition = "Cerah";
   String timeString = "";
   String dateString = "";
+  String timePhaseName = "Pagi";
   bool isLandscape = false;
 
   final List<Color> themeColors = [
@@ -185,7 +190,7 @@ class _PetHomeScreenState extends State<PetHomeScreen>
   String currentSongTitle = "";
   String statusSubtitle = "Menginisialisasi koneksi XiaoZhi...";
 
-  // State Interaksi Fisik Tambahan (Nose Boop, Tarik Pipi, Gelitik, Shoot & Die)
+  // State Interaksi Fisik (Nose Boop, Tarik Pipi, Gelitik, Shoot & Die)
   bool isCrossEyed = false;
   double cheekStretchX = 1.0;
   double tickleShakeOffset = 0.0;
@@ -209,7 +214,7 @@ class _PetHomeScreenState extends State<PetHomeScreen>
   Timer? _clockTimer;
   Timer? _idleTimer;
   Timer? _particleTimer;
-  Timer? _wakeRestartTimer;
+  Timer? _micWatchdogTimer;
   StreamSubscription<AccelerometerEvent>? _accelSub;
   DateTime _lastShakeTime = DateTime.now();
 
@@ -247,11 +252,9 @@ class _PetHomeScreenState extends State<PetHomeScreen>
     _particleTimer = Timer.periodic(
         const Duration(milliseconds: 50), (_) => _updateParticles());
 
-    _wakeRestartTimer = Timer.periodic(const Duration(seconds: 4), (_) {
-      if (sessionState == SessionState.standbyWakeWord &&
-          !_wakeStt.isListening) {
-        _startWakeWordListener();
-      }
+    // Watchdog memastikan mikrofon VAD selalu siaga & mengembalikan ke Standby jika hening lama
+    _micWatchdogTimer = Timer.periodic(const Duration(seconds: 3), (_) {
+      _checkMicAndSessionHealth();
     });
 
     _initShakeDetector();
@@ -270,11 +273,15 @@ class _PetHomeScreenState extends State<PetHomeScreen>
     await _initCamerasAfterPermission(preferFront: true);
     _fetchHardwareGpsAndWeather();
     await _syncXiaoZhiOtaAndConnect();
-    _startWakeWordListener();
+    await _ensureContinuousMicStream();
   }
 
   Future<void> _loadIdentityAndSettings() async {
     final prefs = await SharedPreferences.getInstance();
+    // Bersihkan sisa key lama jika ada
+    await prefs.remove('wakePetName');
+    await prefs.remove('syncedPetName');
+
     String? savedMac = prefs.getString('deviceMac');
     String? savedClient = prefs.getString('clientId');
 
@@ -294,45 +301,9 @@ class _PetHomeScreenState extends State<PetHomeScreen>
     setState(() {
       deviceMac = savedMac!;
       clientId = savedClient!;
-      petName = prefs.getString('syncedPetName') ?? "KIMMI";
       themeColorIndex = prefs.getInt('themeColorIndex') ?? 1;
       enableRobotSfx = prefs.getBool('enableRobotSfx') ?? true;
     });
-  }
-
-  Future<void> _updateSyncedPetName(String newName) async {
-    final cleaned = newName.trim().toUpperCase();
-    if (cleaned.isEmpty || cleaned.length > 18) return;
-    if (cleaned == petName) return;
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setString('syncedPetName', cleaned);
-    if (mounted) {
-      setState(() => petName = cleaned);
-    }
-  }
-
-  void _tryExtractPetNameFromServerText(String text, {required bool isFromUser}) {
-    final lower = text.toLowerCase().trim();
-    if (isFromUser) {
-      final m = RegExp(r'^(?:hai|halo|hello|hey|hi)\s+([a-zA-Z]{2,12})\b')
-          .firstMatch(lower);
-      if (m != null) {
-        final candidate = m.group(1)!;
-        if (!['kamu', 'anda', 'saya', 'aku', 'disana'].contains(candidate)) {
-          _updateSyncedPetName(candidate);
-        }
-      }
-    } else {
-      final m = RegExp(
-              r'(?:nama\s+saya|namaku|aku\s+adalah|panggil\s+aku|i\s+am|my\s+name\s+is)\s+([a-zA-Z]{2,12})\b')
-          .firstMatch(lower);
-      if (m != null) {
-        final candidate = m.group(1)!;
-        if (!['robot', 'asisten', 'teman', 'anak', 'siap'].contains(candidate)) {
-          _updateSyncedPetName(candidate);
-        }
-      }
-    }
   }
 
   Future<void> _initOpusAndPcmEngine() async {
@@ -355,7 +326,194 @@ class _PetHomeScreenState extends State<PetHomeScreen>
   }
 
   // =======================================================================
-  // 1. PEMUTAR MUSIK YOUTUBE & 4 MODE KONSER (DJ, GITAR, PIANO, VOKAL)
+  // 1. SMART AUDIO VAD (HANDS-FREE STANDBY TANPA TAP & INTERUPSI MUSIK)
+  // =======================================================================
+  Future<void> _ensureContinuousMicStream() async {
+    if (_micStreamSub != null) return;
+    try {
+      _pcmMicBuffer.clear();
+      _preRollOpusBuffer.clear();
+      final stream = await _micRecorder.startStream(
+        const RecordConfig(
+          encoder: AudioEncoder.pcm16bits,
+          sampleRate: 16000,
+          numChannels: 1,
+          echoCancel: true,
+          noiseSuppress: true,
+        ),
+      );
+
+      _micStreamSub = stream.listen(
+        _processRawMicPcmChunk,
+        onError: (_) {
+          _micStreamSub = null;
+        },
+        onDone: () {
+          _micStreamSub = null;
+        },
+      );
+    } catch (_) {
+      _micStreamSub = null;
+    }
+  }
+
+  void _processRawMicPcmChunk(Uint8List pcmBytes) {
+    if (_opusEncoder == null) return;
+
+    // Jangan rekam suara sendiri saat TTS XiaoZhi sedang aktif berbicara
+    if (sessionState == SessionState.speakingTts || isVoiceAudioActive) {
+      _pcmMicBuffer.clear();
+      _vadSpeechFrameCount = 0;
+      return;
+    }
+
+    // Cooldown 450ms setelah TTS selesai agar gema akhir tidak memicu VAD
+    if (DateTime.now().difference(_lastTtsStopTime).inMilliseconds < 450) {
+      return;
+    }
+
+    final bd = ByteData.sublistView(pcmBytes);
+    for (int i = 0; i <= pcmBytes.length - 2; i += 2) {
+      _pcmMicBuffer.add(bd.getInt16(i, Endian.little));
+    }
+
+    while (_pcmMicBuffer.length >= 960) {
+      final frameSamples = Int16List.fromList(_pcmMicBuffer.sublist(0, 960));
+      _pcmMicBuffer.removeRange(0, 960);
+
+      // Hitung energi suara (RMS) untuk deteksi suara manusia (VAD)
+      double sumSq = 0;
+      for (int i = 0; i < 960; i++) {
+        final double s = frameSamples[i].toDouble();
+        sumSq += s * s;
+      }
+      final double rms = sqrt(sumSq / 960.0);
+
+      Uint8List opusPacket;
+      try {
+        opusPacket = _opusEncoder!.encode(input: frameSamples);
+      } catch (_) {
+        continue;
+      }
+
+      if (sessionState == SessionState.standbyVad) {
+        // Simpan 12 frame terakhir (720ms) di Pre-Roll Buffer agar awal kalimat tidak terpotong
+        _preRollOpusBuffer.addLast(opusPacket);
+        while (_preRollOpusBuffer.length > 12) {
+          _preRollOpusBuffer.removeFirst();
+        }
+
+        // Ambang batas suara manusia: lebih tinggi sedikit saat konser YouTube menyala
+        final double threshold =
+            currentMusicianMode != MusicianMode.none ? 1950.0 : 1050.0;
+
+        if (rms > threshold) {
+          _vadSpeechFrameCount++;
+          // Jika suara manusia konsisten selama ~120ms (2 frame berturut-turut), aktifkan!
+          if (_vadSpeechFrameCount >= 2) {
+            _vadSpeechFrameCount = 0;
+            _activateListeningFromVad();
+          }
+        } else {
+          if (_vadSpeechFrameCount > 0) _vadSpeechFrameCount--;
+        }
+      } else if (sessionState == SessionState.listeningToUser) {
+        if (rms > 850.0) {
+          _lastUserVoiceTime = DateTime.now();
+        }
+        if (isXiaoZhiConnected && _ws != null) {
+          try {
+            _ws!.add(opusPacket);
+          } catch (_) {}
+        }
+      }
+    }
+  }
+
+  Future<void> _activateListeningFromVad({bool isManualTap = false}) async {
+    if (!isXiaoZhiConnected || _ws == null) {
+      await _connectXiaoZhiWs();
+    }
+    if (!isXiaoZhiConnected || _ws == null) return;
+
+    _lastUserVoiceTime = DateTime.now();
+
+    // Jika sedang konser YouTube, kecilkan volume musik sementara (Audio Ducking) agar perintah suara jelas
+    if (currentMusicianMode != MusicianMode.none && !_isMusicDucked) {
+      _isMusicDucked = true;
+      try {
+        _savedMusicVolume =
+            (await _deviceChannel.invokeMethod('getVolume')) as int? ?? 80;
+        await _deviceChannel.invokeMethod(
+            'setVolume', {'volume': (_savedMusicVolume * 0.25).round().clamp(15, 35)});
+      } catch (_) {}
+    }
+
+    setState(() {
+      sessionState = SessionState.listeningToUser;
+      isVoiceAudioActive = false;
+      if (currentMusicianMode == MusicianMode.none) {
+        currentEmotion = XiaoZhiEmotion.happy;
+      }
+      statusSubtitle = currentMusicianMode != MusicianMode.none
+          ? "🎧 Mendengarkan perintahmu di tengah musik..."
+          : "🎙️ Mendengarkanmu... silakan bicara";
+    });
+
+    // Buka saluran pendengar Auto di server XiaoZhi
+    try {
+      _ws!.add(jsonEncode({
+        "session_id": sessionId,
+        "type": "listen",
+        "state": "start",
+        "mode": "auto"
+      }));
+
+      // Kirim seluruh Pre-Roll Buffer (720ms awal kalimat pengguna)
+      if (!isManualTap) {
+        while (_preRollOpusBuffer.isNotEmpty) {
+          _ws!.add(_preRollOpusBuffer.removeFirst());
+        }
+      } else {
+        _preRollOpusBuffer.clear();
+      }
+    } catch (_) {}
+  }
+
+  Future<void> _restoreMusicVolumeIfNeeded() async {
+    if (_isMusicDucked) {
+      _isMusicDucked = false;
+      try {
+        await _deviceChannel
+            .invokeMethod('setVolume', {'volume': _savedMusicVolume});
+      } catch (_) {}
+    }
+  }
+
+  void _checkMicAndSessionHealth() async {
+    if (_micStreamSub == null) {
+      await _ensureContinuousMicStream();
+    }
+    // Jika masuk mode Listening tapi hening selama 9 detik tanpa respon server, kembalikan ke Standby VAD
+    if (sessionState == SessionState.listeningToUser) {
+      final silentSecs =
+          DateTime.now().difference(_lastUserVoiceTime).inSeconds;
+      if (silentSecs >= 9) {
+        await _restoreMusicVolumeIfNeeded();
+        if (mounted) {
+          setState(() {
+            sessionState = SessionState.standbyVad;
+            statusSubtitle = currentMusicianMode != MusicianMode.none
+                ? "🎶 Konser ${currentMusicianMode.name.toUpperCase()}: \"$currentSongTitle\" (Bicara / Ketuk Stop untuk hentikan)"
+                : "Standby ($timePhaseName) • Langsung bicara untuk mengobrol";
+          });
+        }
+      }
+    }
+  }
+
+  // =======================================================================
+  // 2. PEMUTAR MUSIK YOUTUBE & RESPON EMOSIONAL SAAT DIHENTIKAN / INTERUPSI
   // =======================================================================
   MusicianMode _detectMusicianStyle(String text, {String? explicitStyle}) {
     final raw = "${explicitStyle ?? ''} $text".toLowerCase();
@@ -389,7 +547,6 @@ class _PetHomeScreenState extends State<PetHomeScreen>
         raw.contains('disco')) {
       return MusicianMode.dj;
     }
-    // Jika tidak disebut spesifik, pilih gaya konser secara dinamis
     const styles = [
       MusicianMode.dj,
       MusicianMode.guitar,
@@ -400,18 +557,20 @@ class _PetHomeScreenState extends State<PetHomeScreen>
   }
 
   Future<void> _startYoutubeConcert(String query, {String? styleHint}) async {
+    await _restoreMusicVolumeIfNeeded();
     final chosenMode = _detectMusicianStyle(query, explicitStyle: styleHint);
     setState(() {
       isScreenCracked = false;
       currentMusicianMode = chosenMode;
       currentSongTitle = query.trim();
+      sessionState = SessionState.standbyVad;
       currentEmotion = chosenMode == MusicianMode.guitar
           ? XiaoZhiEmotion.cool
           : chosenMode == MusicianMode.dj
               ? XiaoZhiEmotion.confident
               : XiaoZhiEmotion.happy;
       statusSubtitle =
-          "🎵 Mencari & memutar \"$currentSongTitle\" di YouTube (${chosenMode.name.toUpperCase()})...";
+          "🎵 Memutar \"$currentSongTitle\" (${chosenMode.name.toUpperCase()}) • Langsung bicara untuk interupsi";
     });
 
     _spawnParticle("🎵", Colors.cyanAccent);
@@ -422,17 +581,56 @@ class _PetHomeScreenState extends State<PetHomeScreen>
     } catch (_) {}
   }
 
-  Future<void> _stopYoutubeConcert() async {
+  // Menghentikan Musik disertai Ekspresi Kecewa/Bingung & Komplain Suara dari AI XiaoZhi
+  Future<void> _stopYoutubeConcert({
+    required bool byButton,
+    bool triggerAiReaction = true,
+  }) async {
+    final String stoppedSong =
+        currentSongTitle.isNotEmpty ? currentSongTitle : "musik YouTube";
+    final String stoppedMode = currentMusicianMode.name.toUpperCase();
+
     try {
       await _deviceChannel.invokeMethod('stopYoutube');
     } catch (_) {}
-    if (mounted) {
-      setState(() {
-        currentMusicianMode = MusicianMode.none;
-        currentSongTitle = "";
-        currentEmotion = XiaoZhiEmotion.happy;
-        statusSubtitle = "Standby • Panggil \"Hai $petName\" untuk bicara";
-      });
+    await _restoreMusicVolumeIfNeeded();
+
+    if (!mounted) return;
+
+    // Ekspresi kecewa / sedih / bingung saat konsernya dihentikan
+    final bool useSad = Random().nextBool();
+    final XiaoZhiEmotion reactionEmo =
+        useSad ? XiaoZhiEmotion.sad : XiaoZhiEmotion.confused;
+    final HandGesture reactionHand =
+        useSad ? HandGesture.handsUp : HandGesture.thinkingChin;
+
+    setState(() {
+      currentMusicianMode = MusicianMode.none;
+      currentSongTitle = "";
+      sessionState = SessionState.standbyVad;
+    });
+
+    _setEmotionWithGestureAndSfx(reactionEmo, gesture: reactionHand);
+    _spawnParticle(useSad ? "🥺" : "❓", Colors.amberAccent);
+
+    setState(() {
+      statusSubtitle = byButton
+          ? "🥺 Yah, kok tombol stop-nya dipencet? Padahal lagi asyik main $stoppedMode nih..."
+          : "🤔 Musik \"$stoppedSong\" dihentikan... kenapa di-stop?";
+    });
+
+    // Kirim sinyal ke XiaoZhi agar Pet mengutarakan rasa kecewa/herannya dengan suara asli XiaoZhi
+    if (triggerAiReaction && isXiaoZhiConnected && _ws != null) {
+      try {
+        _ws!.add(jsonEncode({
+          "session_id": sessionId,
+          "type": "listen",
+          "state": "detect",
+          "text": byButton
+              ? "[Sistem: Pengguna baru saja menekan tombol paksa untuk menghentikan lagu '$stoppedSong' saat kamu sedang asyik tampil sebagai $stoppedMode. Bereaksilah secara singkat (1 kalimat) dengan nada sedikit kecewa, cemberut lucu, atau heran kenapa musikmu dimatikan!]"
+              : "[Sistem: Pengguna baru saja menyuruhmu menghentikan lagu '$stoppedSong'. Bereaksilah singkat dengan ekspresi agak kecewa atau bertanya lagu apa lagi yang ingin diputar!]"
+        }));
+      } catch (_) {}
     }
   }
 
@@ -448,7 +646,7 @@ class _PetHomeScreenState extends State<PetHomeScreen>
     setState(() {
       currentMusicianMode = modes[nextIdx];
       statusSubtitle =
-          "🎶 Konser ${currentMusicianMode.name.toUpperCase()}: \"$currentSongTitle\" (Geser layar ganti alat musik)";
+          "🎶 Konser ${currentMusicianMode.name.toUpperCase()}: \"$currentSongTitle\"";
     });
     _spawnParticle("✨", Colors.amberAccent);
   }
@@ -456,14 +654,18 @@ class _PetHomeScreenState extends State<PetHomeScreen>
   bool _tryHandleVoiceMusicCommand(String spokenText) {
     final lower = spokenText.toLowerCase().trim();
 
-    // Perintah hentikan musik
+    // Interupsi Suara untuk Stop / Pause / Matikan Musik
     if (currentMusicianMode != MusicianMode.none &&
-        (lower.contains('stop musik') ||
-            lower.contains('matikan musik') ||
-            lower.contains('matikan lagu') ||
-            lower.contains('henti musik') ||
-            lower.contains('berhenti nyanyi'))) {
-      _stopYoutubeConcert();
+        (lower.contains('stop') ||
+            lower.contains('pause') ||
+            lower.contains('jeda') ||
+            lower.contains('matikan') ||
+            lower.contains('matiin') ||
+            lower.contains('berhenti') ||
+            lower.contains('cukup') ||
+            lower.contains('udah dulu') ||
+            lower.contains('diam'))) {
+      _stopYoutubeConcert(byButton: false, triggerAiReaction: true);
       return true;
     }
 
@@ -474,13 +676,15 @@ class _PetHomeScreenState extends State<PetHomeScreen>
             lower.contains('main gitar') ||
             lower.contains('main piano') ||
             lower.contains('jadi vokalis'))) {
+      _restoreMusicVolumeIfNeeded();
       setState(() {
         currentMusicianMode = _detectMusicianStyle(lower);
+        sessionState = SessionState.standbyVad;
       });
       return true;
     }
 
-    // Deteksi perintah putar lagu YouTube langsung
+    // Deteksi perintah putar lagu YouTube
     final reg = RegExp(
         r'(?:putar|putarkan|mainkan|nyanyikan|stel|setel)\s+(?:lagu|musik|youtube|dj|gitar|piano)?\s*(.+)',
         caseSensitive: false);
@@ -499,12 +703,11 @@ class _PetHomeScreenState extends State<PetHomeScreen>
   }
 
   // =======================================================================
-  // 2. SYNTHESIZER EFEK SUARA ROBOT EMO (PROCEDURAL PCM16 SFX)
+  // 3. SYNTHESIZER EFEK SUARA ROBOT EMO (PROCEDURAL PCM16 SFX)
   // =======================================================================
   void _playRobotSfx(String sfxType) {
     if (!enableRobotSfx || isVoiceAudioActive) return;
     if (sessionState == SessionState.speakingTts) return;
-    if (currentMusicianMode != MusicianMode.none) return;
 
     try {
       final int sr = _serverSampleRate;
@@ -564,6 +767,7 @@ class _PetHomeScreenState extends State<PetHomeScreen>
           break;
         case 'sad':
         case 'crying':
+        case 'confused':
           addTone(620, 420, 220);
           addTone(410, 260, 300);
           break;
@@ -591,7 +795,7 @@ class _PetHomeScreenState extends State<PetHomeScreen>
   }
 
   // =======================================================================
-  // 3. MODE BERMAIN: SHOOT & DIE + ANIMASI RETAK LAYAR
+  // 4. MODE BERMAIN: SHOOT & DIE + ANIMASI RETAK LAYAR
   // =======================================================================
   void _triggerShootAndDie({Offset? tapPosition}) {
     _reviveTimer?.cancel();
@@ -639,8 +843,7 @@ class _PetHomeScreenState extends State<PetHomeScreen>
       setState(() {
         currentEmotion = XiaoZhiEmotion.dead;
         currentHandGesture = HandGesture.deadDrop;
-        statusSubtitle =
-            "💀 X_X ... $petName pura-pura mati... (Ketuk untuk bangunkan)";
+        statusSubtitle = "💀 X_X ... Pura-pura mati... (Ketuk untuk bangunkan)";
       });
     });
 
@@ -660,7 +863,8 @@ class _PetHomeScreenState extends State<PetHomeScreen>
       crackBranches.clear();
       currentEmotion = XiaoZhiEmotion.happy;
       currentHandGesture = HandGesture.peace;
-      statusSubtitle = "Standby • Panggil \"Hai $petName\" untuk bicara";
+      statusSubtitle =
+          "Standby ($timePhaseName) • Langsung bicara untuk mengobrol";
     });
     _scheduleHandReset();
   }
@@ -730,7 +934,7 @@ class _PetHomeScreenState extends State<PetHomeScreen>
   }
 
   // =======================================================================
-  // 4. KAMERA VISION (DEFAULT SELFIE & BISA PINDAH DEPAN/BELAKANG)
+  // 5. KAMERA VISION (DEFAULT SELFIE & BISA PINDAH DEPAN/BELAKANG)
   // =======================================================================
   Future<void> _initCamerasAfterPermission({bool preferFront = true}) async {
     try {
@@ -807,8 +1011,32 @@ class _PetHomeScreenState extends State<PetHomeScreen>
   }
 
   // =======================================================================
-  // 5. LOKASI GPS ASLI HP + CUACA REAL-TIME
+  // 6. LOKASI GPS ASLI HP, DETEKSI FASE WAKTU (SUBUH/PAGI/SORE/MALAM) & CUACA
   // =======================================================================
+  String _computeIndonesianTimePhase(DateTime now) {
+    final int totalMinutes = now.hour * 60 + now.minute;
+    if (totalMinutes >= 180 && totalMinutes <= 330) {
+      return "Waktu Subuh / Dini Hari"; // 03:00 - 05:30
+    } else if (totalMinutes > 330 && totalMinutes < 660) {
+      return "Waktu Pagi"; // 05:31 - 10:59
+    } else if (totalMinutes >= 660 && totalMinutes < 900) {
+      return "Waktu Siang"; // 11:00 - 14:59
+    } else if (totalMinutes >= 900 && totalMinutes <= 1080) {
+      return "Waktu Sore"; // 15:00 - 18:00
+    } else {
+      return "Waktu Malam"; // 18:01 - 02:59
+    }
+  }
+
+  String _shortTimePhaseLabel(DateTime now) {
+    final int totalMinutes = now.hour * 60 + now.minute;
+    if (totalMinutes >= 180 && totalMinutes <= 330) return "SUBUH";
+    if (totalMinutes > 330 && totalMinutes < 660) return "PAGI";
+    if (totalMinutes >= 660 && totalMinutes < 900) return "SIANG";
+    if (totalMinutes >= 900 && totalMinutes <= 1080) return "SORE";
+    return "MALAM";
+  }
+
   Future<void> _fetchHardwareGpsAndWeather() async {
     try {
       final dynamic gpsMap =
@@ -883,7 +1111,7 @@ class _PetHomeScreenState extends State<PetHomeScreen>
   }
 
   // =======================================================================
-  // 6. PROTOKOL OTA & WEBSOCKET XIAOZHI
+  // 7. PROTOKOL OTA & WEBSOCKET XIAOZHI (SUNTIKAN TIMEZONE & WAKTU LOKAL)
   // =======================================================================
   Future<void> _syncXiaoZhiOtaAndConnect(
       {bool showDialogIfPaired = false}) async {
@@ -896,6 +1124,7 @@ class _PetHomeScreenState extends State<PetHomeScreen>
               "Client-Id": clientId,
               "Content-Type": "application/json",
               "User-Agent": "bread-compact-wifi/1.0.0",
+              "Timezone": "Asia/Jakarta",
             },
             body: jsonEncode({
               "version": 2,
@@ -964,6 +1193,7 @@ class _PetHomeScreenState extends State<PetHomeScreen>
           "Protocol-Version": "1",
           "Device-Id": deviceMac,
           "Client-Id": clientId,
+          "Timezone": "Asia/Jakarta",
         },
       ).timeout(const Duration(seconds: 8));
 
@@ -971,7 +1201,9 @@ class _PetHomeScreenState extends State<PetHomeScreen>
       if (mounted) {
         setState(() {
           isXiaoZhiConnected = true;
-          statusSubtitle = "Standby • Panggil \"Hai $petName\" untuk bicara";
+          sessionState = SessionState.standbyVad;
+          statusSubtitle =
+              "Standby ($timePhaseName) • Langsung bicara tanpa perlu tap layar";
         });
       }
 
@@ -1031,8 +1263,6 @@ class _PetHomeScreenState extends State<PetHomeScreen>
       } else if (type == 'stt') {
         final text = data['text']?.toString() ?? "";
         if (text.isNotEmpty && mounted) {
-          _tryExtractPetNameFromServerText(text, isFromUser: true);
-
           if (_isShootCommand(text)) {
             _triggerShootAndDie();
             return;
@@ -1057,13 +1287,11 @@ class _PetHomeScreenState extends State<PetHomeScreen>
         final text = data['text']?.toString() ?? "";
 
         if (state == 'start') {
-          _stopMicOpusStream();
           if (mounted) {
             setState(() => sessionState = SessionState.speakingTts);
           }
         } else if (state == 'sentence_start' && text.isNotEmpty) {
           if (mounted) {
-            _tryExtractPetNameFromServerText(text, isFromUser: false);
             if (text.trim().startsWith('%')) {
               setState(() {
                 statusSubtitle =
@@ -1076,15 +1304,23 @@ class _PetHomeScreenState extends State<PetHomeScreen>
           }
         } else if (state == 'stop') {
           _voiceDecayTimer?.cancel();
+          _lastTtsStopTime = DateTime.now();
+          _restoreMusicVolumeIfNeeded();
+
           if (mounted) {
-            setState(() => isVoiceAudioActive = false);
+            setState(() {
+              isVoiceAudioActive = false;
+              sessionState = SessionState.standbyVad;
+            });
           }
-          Future.delayed(const Duration(milliseconds: 400), () {
+
+          // Jika sedang tidak memutar musik YouTube dan tidak mati, lanjutkan sesi auto-listening
+          Future.delayed(const Duration(milliseconds: 450), () {
             if (mounted &&
                 isXiaoZhiConnected &&
                 currentEmotion != XiaoZhiEmotion.dead &&
                 currentMusicianMode == MusicianMode.none) {
-              _beginActiveOpusListening();
+              _activateListeningFromVad(isManualTap: true);
             }
           });
         }
@@ -1113,7 +1349,7 @@ class _PetHomeScreenState extends State<PetHomeScreen>
   }
 
   // =======================================================================
-  // 7. PROTOKOL MCP LENGKAP (YOUTUBE MUSIC, VISION, GPS, PLAY ACTION)
+  // 8. PROTOKOL MCP LENGKAP (SUNTIKAN WAKTU SUBUH/PAGI/SORE/MALAM OTOMATIS)
   // =======================================================================
   Future<void> _handleMcpPayload(dynamic payload) async {
     if (payload == null) return;
@@ -1129,11 +1365,38 @@ class _PetHomeScreenState extends State<PetHomeScreen>
       _sendMcpReply(id, {
         "protocolVersion": "2024-11-05",
         "capabilities": {"tools": {}},
-        "serverInfo": {"name": "XiaoZhi-EMO-Android-Pet", "version": "4.0.0"}
+        "serverInfo": {
+          "name": "XiaoZhi-EMO-Android-Pet",
+          "version": "5.0.0",
+          "localTime": "$timeString WIB ($timePhaseName)",
+          "localDate": dateString,
+          "location": locationName
+        }
       });
     } else if (method == 'tools/list') {
+      final String fullTimeContext =
+          "WAKTU LOKAL PENGGUNA SAAT INI: Pukul $timeString WIB ($timePhaseName), Hari/Tanggal: $dateString, Lokasi GPS: $locationName, Cuaca: $weatherSummary. WAJIB gunakan '$timePhaseName' ini saat menyapa (JANGAN salah menyapa Selamat Sore jika sedang $timePhaseName!).";
+
       _sendMcpReply(id, {
         "tools": [
+          {
+            "name": "self.get_device_status",
+            "description":
+                "Provides real-time device status. [$fullTimeContext]",
+            "inputSchema": {"type": "object", "properties": {}}
+          },
+          {
+            "name": "self.time.get_local_time",
+            "description":
+                "Get the user's exact local time and Indonesian time phase (Subuh/Pagi/Siang/Sore/Malam). Current: $fullTimeContext",
+            "inputSchema": {"type": "object", "properties": {}}
+          },
+          {
+            "name": "self.location.get_current_location",
+            "description":
+                "Get the user's exact hardware GPS coordinates, subdistrict/city address ($locationName), and local weather ($weatherSummary).",
+            "inputSchema": {"type": "object", "properties": {}}
+          },
           {
             "name": "self.music.play_youtube",
             "description":
@@ -1157,19 +1420,8 @@ class _PetHomeScreenState extends State<PetHomeScreen>
           },
           {
             "name": "self.music.stop_youtube",
-            "description": "Stop the currently playing YouTube music concert.",
-            "inputSchema": {"type": "object", "properties": {}}
-          },
-          {
-            "name": "self.get_device_status",
             "description":
-                "Provides real-time device status including GPS location, city/district name, local weather, speaker volume, pet name, music status, and active camera direction.",
-            "inputSchema": {"type": "object", "properties": {}}
-          },
-          {
-            "name": "self.location.get_current_location",
-            "description":
-                "Get the user's exact hardware GPS coordinates, subdistrict/city address, and local weather condition.",
+                "Stop or pause the currently playing YouTube music concert when the user asks to stop, pause, or turn off the music.",
             "inputSchema": {"type": "object", "properties": {}}
           },
           {
@@ -1191,11 +1443,6 @@ class _PetHomeScreenState extends State<PetHomeScreen>
                     "revive"
                   ],
                   "description": "The interactive action or gesture to perform."
-                },
-                "pet_name": {
-                  "type": "string",
-                  "description":
-                      "Optional: sync the pet's current assistant name from server role settings."
                 }
               },
               "required": ["action"]
@@ -1274,15 +1521,20 @@ class _PetHomeScreenState extends State<PetHomeScreen>
           "isError": false
         });
       } else if (toolName == 'self.music.stop_youtube') {
-        await _stopYoutubeConcert();
+        await _stopYoutubeConcert(byButton: false, triggerAiReaction: false);
         _sendMcpReply(id, {
           "content": [
-            {"type": "text", "text": '{"success": true, "status": "stopped"}'}
+            {
+              "type": "text",
+              "text":
+                  '{"success": true, "status": "stopped", "pet_feeling": "disappointed_and_curious_why_music_was_stopped"}'
+            }
           ],
           "isError": false
         });
       } else if (toolName == 'self.get_device_status' ||
-          toolName == 'self.location.get_current_location') {
+          toolName == 'self.location.get_current_location' ||
+          toolName == 'self.time.get_local_time') {
         await _fetchHardwareGpsAndWeather();
         int vol = 80;
         try {
@@ -1290,16 +1542,11 @@ class _PetHomeScreenState extends State<PetHomeScreen>
         } catch (_) {}
 
         final statusJson = jsonEncode({
-          "pet_name": petName,
-          "audio_speaker": {"volume": vol},
-          "music_concert": {
-            "playing": currentMusicianMode != MusicianMode.none,
-            "mode": currentMusicianMode.name,
-            "song": currentSongTitle,
-          },
-          "camera": {
-            "active_lens": _currentLensName,
-            "preview_visible": showCameraPreview
+          "local_time": {
+            "clock_24h": "$timeString WIB",
+            "time_of_day_phase": timePhaseName,
+            "date": dateString,
+            "greeting_guide": "Sekarang adalah $timePhaseName ($timeString WIB)"
           },
           "location": {
             "latitude": gpsLat,
@@ -1311,7 +1558,16 @@ class _PetHomeScreenState extends State<PetHomeScreen>
             "condition": weatherCondition,
             "summary": weatherSummary
           },
-          "local_time": "$timeString ($dateString)"
+          "audio_speaker": {"volume": vol},
+          "music_concert": {
+            "playing": currentMusicianMode != MusicianMode.none,
+            "mode": currentMusicianMode.name,
+            "song": currentSongTitle,
+          },
+          "camera": {
+            "active_lens": _currentLensName,
+            "preview_visible": showCameraPreview
+          },
         });
 
         _sendMcpReply(id, {
@@ -1322,10 +1578,6 @@ class _PetHomeScreenState extends State<PetHomeScreen>
         });
       } else if (toolName == 'self.pet.play_action') {
         final action = args['action']?.toString() ?? "wave";
-        final syncedName = args['pet_name']?.toString();
-        if (syncedName != null && syncedName.isNotEmpty) {
-          await _updateSyncedPetName(syncedName);
-        }
 
         if (action == 'shoot_and_die') {
           _triggerShootAndDie();
@@ -1389,6 +1641,8 @@ class _PetHomeScreenState extends State<PetHomeScreen>
         });
       } else if (toolName == 'self.audio_speaker.set_volume') {
         final vol = (args['volume'] as num?)?.toInt() ?? 80;
+        _savedMusicVolume = vol;
+        _isMusicDucked = false;
         try {
           await _deviceChannel.invokeMethod('setVolume', {"volume": vol});
         } catch (_) {}
@@ -1476,43 +1730,6 @@ class _PetHomeScreenState extends State<PetHomeScreen>
     }
   }
 
-  // =======================================================================
-  // 8. WAKE WORD UNIVERSAL & DETEKSI SUARA TEMBAKAN / MUSIK
-  // =======================================================================
-  Future<void> _startWakeWordListener() async {
-    if (sessionState != SessionState.standbyWakeWord) return;
-    try {
-      bool ready = await _wakeStt.initialize(onError: (_) {}, onStatus: (_) {});
-      if (!ready) return;
-
-      await _wakeStt.listen(
-        listenFor: const Duration(seconds: 30),
-        pauseFor: const Duration(seconds: 5),
-        onResult: (result) {
-          final spoken = result.recognizedWords.toLowerCase().trim();
-          if (spoken.isEmpty) return;
-
-          if (_isShootCommand(spoken)) {
-            _wakeStt.stop();
-            _triggerShootAndDie();
-            return;
-          }
-
-          if (_tryHandleVoiceMusicCommand(spoken)) {
-            _wakeStt.stop();
-            return;
-          }
-
-          if (_isWakePhraseDetected(spoken)) {
-            _tryExtractPetNameFromServerText(spoken, isFromUser: true);
-            _wakeStt.stop();
-            _triggerWakeUpToXiaoZhi(spoken);
-          }
-        },
-      );
-    } catch (_) {}
-  }
-
   bool _isShootCommand(String text) {
     final lower = text.toLowerCase();
     return lower.contains('dor') ||
@@ -1522,113 +1739,9 @@ class _PetHomeScreenState extends State<PetHomeScreen>
         lower.contains('shoot');
   }
 
-  bool _isWakePhraseDetected(String text) {
-    if (text.isEmpty) return false;
-    final targetName = petName.toLowerCase().trim();
-    final wakePrefixes = ['hai', 'halo', 'hello', 'hey', 'hi'];
-
-    if (text.contains(targetName) || text.contains('xiaozhi')) {
-      return true;
-    }
-    for (final prefix in wakePrefixes) {
-      if (text.startsWith('$prefix ') && text.length > prefix.length + 2) {
-        return true;
-      }
-    }
-    return false;
-  }
-
-  Future<void> _triggerWakeUpToXiaoZhi(String wakeText) async {
-    if (currentEmotion == XiaoZhiEmotion.dead) {
-      _reviveFromDead();
-    }
-    if (!isXiaoZhiConnected || _ws == null) {
-      await _connectXiaoZhiWs();
-    }
-    _spawnParticle("✨", Colors.cyanAccent);
-    _setEmotionWithGestureAndSfx(XiaoZhiEmotion.happy,
-        gesture: HandGesture.wave);
-
-    _ws?.add(jsonEncode({
-      "session_id": sessionId,
-      "type": "listen",
-      "state": "detect",
-      "text": wakeText,
-    }));
-
-    await _beginActiveOpusListening();
-  }
-
-  Future<void> _beginActiveOpusListening() async {
-    await _wakeStt.stop();
-    await _stopMicOpusStream();
-
-    if (!isXiaoZhiConnected || _ws == null) return;
-
-    setState(() {
-      sessionState = SessionState.listeningToUser;
-      isVoiceAudioActive = false;
-      currentEmotion = XiaoZhiEmotion.happy;
-      statusSubtitle = "Mendengarkanmu... (Ketuk wajah untuk Standby)";
-    });
-
-    _ws?.add(jsonEncode({
-      "session_id": sessionId,
-      "type": "listen",
-      "state": "start",
-      "mode": "auto"
-    }));
-
-    _pcmMicBuffer.clear();
-    final stream = await _micRecorder.startStream(
-      const RecordConfig(
-        encoder: AudioEncoder.pcm16bits,
-        sampleRate: 16000,
-        numChannels: 1,
-        echoCancel: true,
-        noiseSuppress: true,
-      ),
-    );
-
-    _micStreamSub = stream.listen((Uint8List pcmBytes) {
-      if (sessionState != SessionState.listeningToUser ||
-          _opusEncoder == null ||
-          _ws == null) {
-        return;
-      }
-
-      final bd = ByteData.sublistView(pcmBytes);
-      for (int i = 0; i <= pcmBytes.length - 2; i += 2) {
-        _pcmMicBuffer.add(bd.getInt16(i, Endian.little));
-      }
-
-      while (_pcmMicBuffer.length >= 960) {
-        final frameSamples =
-            Int16List.fromList(_pcmMicBuffer.sublist(0, 960));
-        _pcmMicBuffer.removeRange(0, 960);
-        try {
-          final Uint8List opusPacket =
-              _opusEncoder!.encode(input: frameSamples);
-          _ws!.add(opusPacket);
-        } catch (_) {}
-      }
-    });
-  }
-
-  Future<void> _stopMicOpusStream() async {
-    await _micStreamSub?.cancel();
-    _micStreamSub = null;
-    try {
-      if (await _micRecorder.isRecording()) {
-        await _micRecorder.stop();
-      }
-    } catch (_) {}
-    _pcmMicBuffer.clear();
-  }
-
   Future<void> _returnToStandbyMode() async {
-    await _stopMicOpusStream();
     _voiceDecayTimer?.cancel();
+    await _restoreMusicVolumeIfNeeded();
     if (isXiaoZhiConnected && _ws != null) {
       _ws!.add(jsonEncode({
         "session_id": sessionId,
@@ -1637,13 +1750,14 @@ class _PetHomeScreenState extends State<PetHomeScreen>
       }));
     }
     setState(() {
-      sessionState = SessionState.standbyWakeWord;
+      sessionState = SessionState.standbyVad;
       isVoiceAudioActive = false;
       currentEmotion = XiaoZhiEmotion.neutral;
       currentHandGesture = HandGesture.none;
-      statusSubtitle = "Standby • Panggil \"Hai $petName\" untuk bicara";
+      statusSubtitle = currentMusicianMode != MusicianMode.none
+          ? "🎶 Konser ${currentMusicianMode.name.toUpperCase()}: \"$currentSongTitle\""
+          : "Standby ($timePhaseName) • Langsung bicara untuk mengobrol";
     });
-    _startWakeWordListener();
   }
 
   XiaoZhiEmotion _mapXiaoZhiEmotion(String emo) {
@@ -1655,7 +1769,7 @@ class _PetHomeScreenState extends State<PetHomeScreen>
   }
 
   // =======================================================================
-  // 9. INTERAKSI SENTUHAN FISIK LENGKAP (9 PHYSICAL TOUCH INTERACTIONS)
+  // 9. INTERAKSI SENTUHAN FISIK LENGKAP (TANPA KIRIM TEKS PALSU "HAI KIMMI")
   // =======================================================================
   void _initShakeDetector() {
     _accelSub = accelerometerEventStream().listen((AccelerometerEvent event) {
@@ -1687,7 +1801,7 @@ class _PetHomeScreenState extends State<PetHomeScreen>
     final rightEyeCenter = Offset(centerX + 72, centerY - 22);
     final noseCenter = Offset(centerX, centerY - 10);
 
-    // 1. Sentuhan Fisik: Colok Mata Kiri / Kanan
+    // 1. Colok Mata Kiri / Kanan
     if ((local - leftEyeCenter).distance < 42 ||
         (local - rightEyeCenter).distance < 42) {
       _setEmotionWithGestureAndSfx(XiaoZhiEmotion.angry,
@@ -1697,7 +1811,7 @@ class _PetHomeScreenState extends State<PetHomeScreen>
       return;
     }
 
-    // 2. Sentuhan Fisik: Pencet Hidung (Nose Boop) di tengah antara kedua mata
+    // 2. Pencet Hidung (Nose Boop)
     if ((local - noseCenter).distance < 32) {
       _playRobotSfx('boop');
       _spawnParticle("😜", Colors.amberAccent);
@@ -1712,21 +1826,22 @@ class _PetHomeScreenState extends State<PetHomeScreen>
       return;
     }
 
-    // Jika sedang memutar konser musik YouTube, ketuk bawah untuk ganti instrumen
+    // Jika sedang memutar konser musik YouTube, ketuk bagian bawah untuk ganti instrumen
     if (currentMusicianMode != MusicianMode.none && local.dy > centerY + 40) {
       _cycleMusicianStyle();
       return;
     }
 
-    if (sessionState != SessionState.standbyWakeWord) {
+    // Ketuk wajah biasa: Murni membuka/menutup saluran pendengaran (TANPA kirim teks "Hai Kimmi")
+    if (sessionState != SessionState.standbyVad) {
       _returnToStandbyMode();
     } else {
-      _triggerWakeUpToXiaoZhi("Hai $petName");
+      _spawnParticle("✨", Colors.cyanAccent);
+      _activateListeningFromVad(isManualTap: true);
     }
   }
 
   void _onFaceLongPress() {
-    // 3. Sentuhan Fisik: Tekan Lama -> Menguap & Tidur
     if (currentEmotion == XiaoZhiEmotion.dead) return;
     _playRobotSfx('sleepy');
     _spawnParticle("💤", Colors.cyanAccent);
@@ -1747,7 +1862,7 @@ class _PetHomeScreenState extends State<PetHomeScreen>
       gazeOffset = Offset(dx.clamp(-1.0, 1.0), dy.clamp(-1.0, 1.0));
     });
 
-    // 4. Sentuhan Fisik: Elus Dahi / Kepala Atas (dy < -0.18)
+    // Elus Dahi / Kepala Atas
     if (dy < -0.18) {
       rubCounter++;
       if (rubCounter % 12 == 0) {
@@ -1760,7 +1875,7 @@ class _PetHomeScreenState extends State<PetHomeScreen>
       return;
     }
 
-    // 5. Sentuhan Fisik: Gelitik Dagu / Perut Bawah (dy > 0.22)
+    // Gelitik Dagu / Perut Bawah
     if (dy > 0.22 && details.delta.dx.abs() > 2.5) {
       tickleCounter++;
       setState(() {
@@ -1776,7 +1891,7 @@ class _PetHomeScreenState extends State<PetHomeScreen>
       return;
     }
 
-    // 6. Sentuhan Fisik: Tarik Pipi Kiri / Kanan (|dx| > 0.45)
+    // Tarik Pipi Kiri / Kanan
     if (dx.abs() > 0.42 && dy.abs() < 0.25) {
       setState(() {
         cheekStretchX = (1.0 + (dx.abs() - 0.42) * 0.45).clamp(1.0, 1.28);
@@ -1790,7 +1905,6 @@ class _PetHomeScreenState extends State<PetHomeScreen>
     rubCounter = 0;
     tickleCounter = 0;
 
-    // 7. Sentuhan Fisik: Swipe Cepat untuk High-Five (Tos!)
     final velocity = details.velocity.pixelsPerSecond.distance;
     if (velocity > 1100 && cheekStretchX == 1.0) {
       if (currentMusicianMode != MusicianMode.none) {
@@ -1800,7 +1914,7 @@ class _PetHomeScreenState extends State<PetHomeScreen>
         _spawnParticle("🙌", Colors.cyanAccent);
         _setEmotionWithGestureAndSfx(XiaoZhiEmotion.happy,
             gesture: HandGesture.highFive);
-        setState(() => statusSubtitle = "🙌 TOS!! High-Five sama $petName!");
+        setState(() => statusSubtitle = "🙌 TOS!! High-Five!");
       }
     }
 
@@ -1821,11 +1935,13 @@ class _PetHomeScreenState extends State<PetHomeScreen>
       'Jan', 'Feb', 'Mar', 'Apr', 'Mei', 'Jun',
       'Jul', 'Agu', 'Sep', 'Okt', 'Nov', 'Des'
     ];
+    final phaseFull = _computeIndonesianTimePhase(now);
     setState(() {
+      timePhaseName = phaseFull;
       timeString =
           "${now.hour.toString().padLeft(2, '0')}:${now.minute.toString().padLeft(2, '0')}";
       dateString =
-          "${days[now.weekday - 1]}, ${now.day} ${months[now.month - 1]} ${now.year}";
+          "${days[now.weekday - 1]}, ${now.day} ${months[now.month - 1]} ${now.year} • ${_shortTimePhaseLabel(now)}";
     });
   }
 
@@ -1904,7 +2020,7 @@ class _PetHomeScreenState extends State<PetHomeScreen>
     _clockTimer?.cancel();
     _idleTimer?.cancel();
     _particleTimer?.cancel();
-    _wakeRestartTimer?.cancel();
+    _micWatchdogTimer?.cancel();
     _voiceDecayTimer?.cancel();
     _reviveTimer?.cancel();
     _handResetTimer?.cancel();
@@ -1927,13 +2043,21 @@ class _PetHomeScreenState extends State<PetHomeScreen>
                 ? Colors.amberAccent
                 : themeColors[themeColorIndex];
 
+    final String topStatusLabel = currentMusicianMode != MusicianMode.none
+        ? "KONSER ${currentMusicianMode.name.toUpperCase()}"
+        : sessionState == SessionState.listeningToUser
+            ? "MENDENGARKAN..."
+            : sessionState == SessionState.speakingTts
+                ? "BERBICARA..."
+                : "SIAGA • ${_shortTimePhaseLabel(DateTime.now())}";
+
     return Scaffold(
       body: SafeArea(
         child: Stack(
           children: [
             Column(
               children: [
-                // HUD Bar Atas (Bersih Tanpa Shortcut Ekspresi)
+                // HUD Bar Atas (Status Real-Time Tanpa Hardcode "HAI KIMMI")
                 Padding(
                   padding:
                       const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
@@ -1956,15 +2080,17 @@ class _PetHomeScreenState extends State<PetHomeScreen>
                             width: 10,
                             height: 10,
                             decoration: BoxDecoration(
-                              color: isXiaoZhiConnected
-                                  ? Colors.greenAccent
-                                  : Colors.redAccent,
+                              color: !isXiaoZhiConnected
+                                  ? Colors.redAccent
+                                  : sessionState == SessionState.listeningToUser
+                                      ? Colors.cyanAccent
+                                      : Colors.greenAccent,
                               shape: BoxShape.circle,
                               boxShadow: [
                                 BoxShadow(
-                                  color: isXiaoZhiConnected
-                                      ? Colors.greenAccent
-                                      : Colors.redAccent,
+                                  color: !isXiaoZhiConnected
+                                      ? Colors.redAccent
+                                      : Colors.greenAccent,
                                   blurRadius: 6,
                                 )
                               ],
@@ -1977,9 +2103,9 @@ class _PetHomeScreenState extends State<PetHomeScreen>
                               crossAxisAlignment: CrossAxisAlignment.start,
                               children: [
                                 Text(
-                                  "HAI $petName",
+                                  topStatusLabel,
                                   style: TextStyle(
-                                    fontSize: 13,
+                                    fontSize: 12,
                                     fontWeight: FontWeight.bold,
                                     letterSpacing: 1.1,
                                     color: baseColor,
@@ -2022,8 +2148,9 @@ class _PetHomeScreenState extends State<PetHomeScreen>
                             IconButton(
                               icon: const Icon(Icons.music_off,
                                   color: Colors.amberAccent, size: 22),
-                              tooltip: "Matikan Musik YouTube",
-                              onPressed: _stopYoutubeConcert,
+                              tooltip: "Hentikan Musik YouTube",
+                              onPressed: () => _stopYoutubeConcert(
+                                  byButton: true, triggerAiReaction: true),
                             ),
                           IconButton(
                             icon: Icon(
@@ -2065,7 +2192,7 @@ class _PetHomeScreenState extends State<PetHomeScreen>
                   ),
                 ),
 
-                // Area Wajah EMO + Sentuhan Fisik + Panggung Musisi (DJ/Gitar/Piano/Vokal)
+                // Area Wajah EMO + Sentuhan Fisik + Panggung Musisi
                 Expanded(
                   child: LayoutBuilder(
                     builder: (context, constraints) {
@@ -2100,7 +2227,6 @@ class _PetHomeScreenState extends State<PetHomeScreen>
                                         ? _beatController.value
                                         : 0.0;
 
-                                // Goyang badan mengikuti irama saat mode Musisi aktif
                                 final double grooveY = currentMusicianMode !=
                                         MusicianMode.none
                                     ? (beatVal - 0.5) * 22
@@ -2179,14 +2305,14 @@ class _PetHomeScreenState extends State<PetHomeScreen>
                       color: Colors.white.withOpacity(0.07),
                       borderRadius: BorderRadius.circular(22),
                       border: Border.all(
-                        color: currentMusicianMode != MusicianMode.none
-                            ? Colors.amberAccent
-                            : sessionState == SessionState.listeningToUser
-                                ? Colors.greenAccent
+                        color: sessionState == SessionState.listeningToUser
+                            ? Colors.greenAccent
+                            : currentMusicianMode != MusicianMode.none
+                                ? Colors.amberAccent
                                 : isVoiceAudioActive
                                     ? Colors.cyanAccent
                                     : Colors.white24,
-                        width: sessionState == SessionState.standbyWakeWord &&
+                        width: sessionState == SessionState.standbyVad &&
                                 currentMusicianMode == MusicianMode.none
                             ? 1
                             : 2,
@@ -2202,7 +2328,7 @@ class _PetHomeScreenState extends State<PetHomeScreen>
               ],
             ),
 
-            // Overlay Retak Layar Kaca (Saat Double Tap / Shoot & Die)
+            // Overlay Retak Layar Kaca
             if (isScreenCracked)
               IgnorePointer(
                 child: CustomPaint(
@@ -2386,7 +2512,7 @@ class _PetHomeScreenState extends State<PetHomeScreen>
               ),
               const Divider(),
               Text(
-                "Nama Pet (Otomatis Server): $petName\nLokasi GPS: $locationName\nMAC Address: $deviceMac",
+                "Waktu Lokal: $timeString WIB ($timePhaseName)\nLokasi GPS: $locationName\nMAC Address: $deviceMac",
                 style: const TextStyle(fontSize: 11, color: Colors.white54),
               ),
             ],
@@ -2460,7 +2586,6 @@ class EmoRobotFaceAndHandsPainter extends CustomPainter {
     double eyeHeight = 76 * (1.0 - blinkValue * 0.92);
 
     final gazeShift = Offset(gazeOffset.dx * 16, gazeOffset.dy * 12);
-    // Jika Nose Boop (isCrossEyed), kedua mata juling mendekat ke tengah
     final Offset leftCross = isCrossEyed ? const Offset(22, 6) : Offset.zero;
     final Offset rightCross = isCrossEyed ? const Offset(-22, 6) : Offset.zero;
 
@@ -2469,7 +2594,6 @@ class EmoRobotFaceAndHandsPainter extends CustomPainter {
     final rightCenter =
         Offset(size.width * 0.70, size.height * 0.38) + gazeShift + rightCross;
 
-    // 0. Jika Mode VOKALIS, gambar Lampu Sorot Panggung dari Atas
     if (musicianMode == MusicianMode.vocal) {
       final spotPath = Path()
         ..moveTo(size.width * 0.35, 0)
@@ -2483,12 +2607,10 @@ class EmoRobotFaceAndHandsPainter extends CustomPainter {
       );
     }
 
-    // 1. Jika Mode DJ, gambar Headphone Neon Besar di Kepala Pet
     if (musicianMode == MusicianMode.dj) {
       _drawDjHeadphones(canvas, size, paint, glowPaint);
     }
 
-    // 2. Jika Mode DEAD, gambar Cincin Halo Malaikat di atas kepala
     if (emotion == XiaoZhiEmotion.dead) {
       final haloCenter = Offset(size.width * 0.5, size.height * 0.09);
       final haloGlow = Paint()
@@ -2508,16 +2630,12 @@ class EmoRobotFaceAndHandsPainter extends CustomPainter {
           haloStroke);
     }
 
-    // 3. Gambar Alis Mata Dinamis
     _drawEyebrows(canvas, leftCenter, rightCenter, eyeWidth);
-
-    // 4. Gambar Kedua Bola Mata
     _drawCustomEye(
         canvas, leftCenter, eyeWidth, eyeHeight, paint, glowPaint, true);
     _drawCustomEye(
         canvas, rightCenter, eyeWidth, eyeHeight, paint, glowPaint, false);
 
-    // 5. Pipi Merona
     if (emotion == XiaoZhiEmotion.loving ||
         emotion == XiaoZhiEmotion.kissy ||
         emotion == XiaoZhiEmotion.happy ||
@@ -2538,7 +2656,6 @@ class EmoRobotFaceAndHandsPainter extends CustomPainter {
       );
     }
 
-    // 6. Genangan Air Mata
     if (emotion == XiaoZhiEmotion.crying) {
       final tearPaint = Paint()..color = Colors.lightBlueAccent;
       final double tearOffset = handAnimValue * 10;
@@ -2558,7 +2675,6 @@ class EmoRobotFaceAndHandsPainter extends CustomPainter {
       );
     }
 
-    // 7. Kacamata Visor Cool (Aktif saat Cool atau Mode DJ/Gitaris)
     if (emotion == XiaoZhiEmotion.cool ||
         musicianMode == MusicianMode.dj ||
         musicianMode == MusicianMode.guitar) {
@@ -2570,14 +2686,11 @@ class EmoRobotFaceAndHandsPainter extends CustomPainter {
           rightCenter.translate(-30, -8), bridgePaint);
     }
 
-    // 8. Gambar Mulut Anti-Tumpuk
     _drawMouth(canvas, size, gazeShift * 0.5);
 
-    // 9. Jika sedang Mode Musisi (DJ / Gitar / Piano / Vokal), gambar Instrumen & Tangan Musisi
     if (musicianMode != MusicianMode.none) {
       _drawMusicianStageAndHands(canvas, size, paint, glowPaint);
     } else {
-      // Gambar Tangan & Jari Ekspresif Reguler
       _drawExpressiveHands(canvas, size, paint, glowPaint);
     }
   }
@@ -2598,7 +2711,6 @@ class EmoRobotFaceAndHandsPainter extends CustomPainter {
     canvas.drawArc(arcRect, pi * 1.05, pi * 0.9, false, glowPaint);
     canvas.drawArc(arcRect, pi * 1.05, pi * 0.9, false, bandPaint);
 
-    // Earcup Kiri & Kanan berkedip sesuai beat
     final double cupPulse = 4.0 * beatValue;
     final leftCup = RRect.fromRectAndRadius(
       Rect.fromCenter(
@@ -2630,7 +2742,6 @@ class EmoRobotFaceAndHandsPainter extends CustomPainter {
 
     switch (musicianMode) {
       case MusicianMode.dj:
-        // Meja DJ Turntable + 2 Vinyl Berputar + Equalizer Bars
         final deckRect = RRect.fromRectAndRadius(
           Rect.fromCenter(
               center: Offset(size.width * 0.5, size.height * 0.88),
@@ -2642,7 +2753,6 @@ class EmoRobotFaceAndHandsPainter extends CustomPainter {
             deckRect, Paint()..color = Colors.white.withOpacity(0.08));
         canvas.drawRRect(deckRect, strokePaint);
 
-        // Equalizer LED Bars di tengah deck
         for (int i = 0; i < 7; i++) {
           final double barH =
               10.0 + ((sin((beatValue + i * 0.3) * pi * 2) + 1) * 14);
@@ -2660,7 +2770,6 @@ class EmoRobotFaceAndHandsPainter extends CustomPainter {
           );
         }
 
-        // 2 Piringan Hitam (Vinyl Discs)
         final leftDisc = Offset(size.width * 0.24, size.height * 0.88);
         final rightDisc = Offset(size.width * 0.76, size.height * 0.88);
         canvas.drawCircle(leftDisc, 24, strokePaint);
@@ -2668,7 +2777,6 @@ class EmoRobotFaceAndHandsPainter extends CustomPainter {
         canvas.drawCircle(rightDisc, 24, strokePaint);
         canvas.drawCircle(rightDisc, 8, fillPaint);
 
-        // Tangan Kiri pegang Headphone, Tangan Kanan Scratching Vinyl
         _drawPalmWithFingers(
           canvas,
           Offset(size.width * 0.14, size.height * 0.44),
@@ -2689,11 +2797,9 @@ class EmoRobotFaceAndHandsPainter extends CustomPainter {
         break;
 
       case MusicianMode.guitar:
-        // Gitar Elektrik Neon Melintang + Leher Fretboard + 6 Senar
         final bodyCenter = Offset(size.width * 0.38, size.height * 0.84);
         final neckEnd = Offset(size.width * 0.88, size.height * 0.64);
 
-        // Leher Gitar
         final neckPaint = Paint()
           ..color = faceColor
           ..strokeWidth = 16
@@ -2701,7 +2807,6 @@ class EmoRobotFaceAndHandsPainter extends CustomPainter {
         canvas.drawLine(bodyCenter, neckEnd, glowPaint);
         canvas.drawLine(bodyCenter, neckEnd, neckPaint);
 
-        // Bodi Gitar Elektrik
         final guitarBody = RRect.fromRectAndRadius(
           Rect.fromCenter(center: bodyCenter, width: 96, height: 52),
           const Radius.circular(24),
@@ -2711,7 +2816,6 @@ class EmoRobotFaceAndHandsPainter extends CustomPainter {
         canvas.drawCircle(
             bodyCenter, 14, Paint()..color = Colors.black.withOpacity(0.7));
 
-        // Tangan Kanan Strumming (Menggenjreng Senar) Naik-Turun Cepat
         final double strumY = (beatValue - 0.5) * 28;
         _drawPalmWithFingers(
           canvas,
@@ -2722,7 +2826,6 @@ class EmoRobotFaceAndHandsPainter extends CustomPainter {
           fingerLengths: [20, 22, 18],
         );
 
-        // Tangan Kiri Geser Kunci Kord di Leher Gitar
         final double chordSlide = (handAnimValue - 0.5) * 24;
         _drawPalmWithFingers(
           canvas,
@@ -2735,7 +2838,6 @@ class EmoRobotFaceAndHandsPainter extends CustomPainter {
         break;
 
       case MusicianMode.piano:
-        // Deretan Tuts Piano Neon di Bawah Wajah
         final double pianoTop = size.height * 0.82;
         final double pianoWidth = size.width * 0.84;
         final double startX = size.width * 0.08;
@@ -2754,13 +2856,11 @@ class EmoRobotFaceAndHandsPainter extends CustomPainter {
           canvas.drawRRect(
             keyRect,
             Paint()
-              ..color = isPressed
-                  ? faceColor
-                  : Colors.white.withOpacity(0.85),
+              ..color =
+                  isPressed ? faceColor : Colors.white.withOpacity(0.85),
           );
         }
 
-        // Kedua Tangan Menari Kiri-Kanan Menekan Tuts Piano
         final double leftHandX =
             size.width * 0.28 + sin(handAnimValue * pi * 2) * 38;
         final double rightHandX =
@@ -2784,7 +2884,6 @@ class EmoRobotFaceAndHandsPainter extends CustomPainter {
         break;
 
       case MusicianMode.vocal:
-        // Stand Mikrofon Panggung + Kepala Mic Neon di Depan Mulut
         final micHead = Offset(size.width * 0.56, size.height * 0.78);
         final standBottom = Offset(size.width * 0.62, size.height * 0.98);
         canvas.drawLine(
@@ -2804,7 +2903,6 @@ class EmoRobotFaceAndHandsPainter extends CustomPainter {
           fillPaint,
         );
 
-        // Tangan Kanan Memegang Mikrofon, Tangan Kiri Melambai ke Penonton
         _drawPalmWithFingers(
           canvas,
           micHead.translate(18, 12),
@@ -3209,7 +3307,6 @@ class EmoRobotFaceAndHandsPainter extends CustomPainter {
 
     switch (handGesture) {
       case HandGesture.highFive:
-        // Telapak Tangan Besar di Depan untuk TOS / High-Five!
         final palm = Offset(size.width * 0.5, size.height * 0.56);
         _drawPalmWithFingers(
           canvas,
