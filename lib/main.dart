@@ -44,7 +44,7 @@ class XiaoZhiPureApp extends StatelessWidget {
   }
 }
 
-// 23 Ekspresi Lengkap ala Robot EMO + State Dead (Shoot & Die)
+// 23 Ekspresi Lengkap ala Robot EMO + State Dead
 enum XiaoZhiEmotion {
   neutral,
   happy,
@@ -81,7 +81,17 @@ enum HandGesture {
   angryFists,
   handsUp,
   coverCheeks,
+  highFive,
   deadDrop,
+}
+
+// 4 Mode Musisi Konser YouTube
+enum MusicianMode {
+  none,
+  dj,
+  guitar,
+  piano,
+  vocal,
 }
 
 enum SessionState { standbyWakeWord, listeningToUser, speakingTts }
@@ -171,9 +181,14 @@ class _PetHomeScreenState extends State<PetHomeScreen>
 
   XiaoZhiEmotion currentEmotion = XiaoZhiEmotion.neutral;
   HandGesture currentHandGesture = HandGesture.none;
+  MusicianMode currentMusicianMode = MusicianMode.none;
+  String currentSongTitle = "";
   String statusSubtitle = "Menginisialisasi koneksi XiaoZhi...";
 
-  // State Permainan Shoot & Die + Layar Retak
+  // State Interaksi Fisik Tambahan (Nose Boop, Tarik Pipi, Gelitik, Shoot & Die)
+  bool isCrossEyed = false;
+  double cheekStretchX = 1.0;
+  double tickleShakeOffset = 0.0;
   bool isScreenCracked = false;
   double shootFlashOpacity = 0.0;
   Offset crackOrigin = const Offset(180, 300);
@@ -183,12 +198,14 @@ class _PetHomeScreenState extends State<PetHomeScreen>
 
   Offset gazeOffset = Offset.zero;
   int rubCounter = 0;
+  int tickleCounter = 0;
   final List<FloatingParticle> particles = [];
 
   late AnimationController _blinkController;
   late AnimationController _floatController;
   late AnimationController _talkController;
   late AnimationController _handController;
+  late AnimationController _beatController;
   Timer? _clockTimer;
   Timer? _idleTimer;
   Timer? _particleTimer;
@@ -213,7 +230,11 @@ class _PetHomeScreenState extends State<PetHomeScreen>
     )..repeat(reverse: true);
     _handController = AnimationController(
       vsync: this,
-      duration: const Duration(milliseconds: 550),
+      duration: const Duration(milliseconds: 520),
+    )..repeat(reverse: true);
+    _beatController = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 380),
     )..repeat(reverse: true);
 
     _updateClock();
@@ -273,7 +294,7 @@ class _PetHomeScreenState extends State<PetHomeScreen>
     setState(() {
       deviceMac = savedMac!;
       clientId = savedClient!;
-      petName = prefs.getString(' syncedPetName') ?? "KIMMI";
+      petName = prefs.getString('syncedPetName') ?? "KIMMI";
       themeColorIndex = prefs.getInt('themeColorIndex') ?? 1;
       enableRobotSfx = prefs.getBool('enableRobotSfx') ?? true;
     });
@@ -284,7 +305,7 @@ class _PetHomeScreenState extends State<PetHomeScreen>
     if (cleaned.isEmpty || cleaned.length > 18) return;
     if (cleaned == petName) return;
     final prefs = await SharedPreferences.getInstance();
-    await prefs.setString(' syncedPetName', cleaned);
+    await prefs.setString('syncedPetName', cleaned);
     if (mounted) {
       setState(() => petName = cleaned);
     }
@@ -334,11 +355,156 @@ class _PetHomeScreenState extends State<PetHomeScreen>
   }
 
   // =======================================================================
-  // 1. SYNTHESIZER EFEK SUARA ROBOT EMO (PROCEDURAL PCM16 SFX)
+  // 1. PEMUTAR MUSIK YOUTUBE & 4 MODE KONSER (DJ, GITAR, PIANO, VOKAL)
+  // =======================================================================
+  MusicianMode _detectMusicianStyle(String text, {String? explicitStyle}) {
+    final raw = "${explicitStyle ?? ''} $text".toLowerCase();
+    if (raw.contains('gitar') ||
+        raw.contains('guitar') ||
+        raw.contains('rock') ||
+        raw.contains('metal') ||
+        raw.contains('band')) {
+      return MusicianMode.guitar;
+    }
+    if (raw.contains('piano') ||
+        raw.contains('keyboard') ||
+        raw.contains('klasik') ||
+        raw.contains('classic') ||
+        raw.contains('jazz') ||
+        raw.contains('ballad')) {
+      return MusicianMode.piano;
+    }
+    if (raw.contains('vokal') ||
+        raw.contains('vocal') ||
+        raw.contains('nyanyi') ||
+        raw.contains('sing') ||
+        raw.contains('karaoke')) {
+      return MusicianMode.vocal;
+    }
+    if (raw.contains('dj') ||
+        raw.contains('remix') ||
+        raw.contains('jedag') ||
+        raw.contains('edm') ||
+        raw.contains('bass') ||
+        raw.contains('disco')) {
+      return MusicianMode.dj;
+    }
+    // Jika tidak disebut spesifik, pilih gaya konser secara dinamis
+    const styles = [
+      MusicianMode.dj,
+      MusicianMode.guitar,
+      MusicianMode.piano,
+      MusicianMode.vocal
+    ];
+    return styles[Random().nextInt(styles.length)];
+  }
+
+  Future<void> _startYoutubeConcert(String query, {String? styleHint}) async {
+    final chosenMode = _detectMusicianStyle(query, explicitStyle: styleHint);
+    setState(() {
+      isScreenCracked = false;
+      currentMusicianMode = chosenMode;
+      currentSongTitle = query.trim();
+      currentEmotion = chosenMode == MusicianMode.guitar
+          ? XiaoZhiEmotion.cool
+          : chosenMode == MusicianMode.dj
+              ? XiaoZhiEmotion.confident
+              : XiaoZhiEmotion.happy;
+      statusSubtitle =
+          "🎵 Mencari & memutar \"$currentSongTitle\" di YouTube (${chosenMode.name.toUpperCase()})...";
+    });
+
+    _spawnParticle("🎵", Colors.cyanAccent);
+    _spawnParticle("🎶", Colors.pinkAccent);
+
+    try {
+      await _deviceChannel.invokeMethod('playYoutube', {'query': query});
+    } catch (_) {}
+  }
+
+  Future<void> _stopYoutubeConcert() async {
+    try {
+      await _deviceChannel.invokeMethod('stopYoutube');
+    } catch (_) {}
+    if (mounted) {
+      setState(() {
+        currentMusicianMode = MusicianMode.none;
+        currentSongTitle = "";
+        currentEmotion = XiaoZhiEmotion.happy;
+        statusSubtitle = "Standby • Panggil \"Hai $petName\" untuk bicara";
+      });
+    }
+  }
+
+  void _cycleMusicianStyle() {
+    if (currentMusicianMode == MusicianMode.none) return;
+    const modes = [
+      MusicianMode.dj,
+      MusicianMode.guitar,
+      MusicianMode.piano,
+      MusicianMode.vocal
+    ];
+    final nextIdx = (modes.indexOf(currentMusicianMode) + 1) % modes.length;
+    setState(() {
+      currentMusicianMode = modes[nextIdx];
+      statusSubtitle =
+          "🎶 Konser ${currentMusicianMode.name.toUpperCase()}: \"$currentSongTitle\" (Geser layar ganti alat musik)";
+    });
+    _spawnParticle("✨", Colors.amberAccent);
+  }
+
+  bool _tryHandleVoiceMusicCommand(String spokenText) {
+    final lower = spokenText.toLowerCase().trim();
+
+    // Perintah hentikan musik
+    if (currentMusicianMode != MusicianMode.none &&
+        (lower.contains('stop musik') ||
+            lower.contains('matikan musik') ||
+            lower.contains('matikan lagu') ||
+            lower.contains('henti musik') ||
+            lower.contains('berhenti nyanyi'))) {
+      _stopYoutubeConcert();
+      return true;
+    }
+
+    // Perintah ganti gaya alat musik saat lagu sedang jalan
+    if (currentMusicianMode != MusicianMode.none &&
+        (lower.contains('ganti gaya') ||
+            lower.contains('jadi dj') ||
+            lower.contains('main gitar') ||
+            lower.contains('main piano') ||
+            lower.contains('jadi vokalis'))) {
+      setState(() {
+        currentMusicianMode = _detectMusicianStyle(lower);
+      });
+      return true;
+    }
+
+    // Deteksi perintah putar lagu YouTube langsung
+    final reg = RegExp(
+        r'(?:putar|putarkan|mainkan|nyanyikan|stel|setel)\s+(?:lagu|musik|youtube|dj|gitar|piano)?\s*(.+)',
+        caseSensitive: false);
+    final match = reg.firstMatch(lower);
+    if (match != null) {
+      String songQuery = match.group(1)?.trim() ?? "";
+      songQuery = songQuery
+          .replaceAll(RegExp(r'\b(di youtube|dari youtube|dong|ya)\b'), '')
+          .trim();
+      if (songQuery.length >= 2) {
+        _startYoutubeConcert(songQuery, styleHint: lower);
+        return true;
+      }
+    }
+    return false;
+  }
+
+  // =======================================================================
+  // 2. SYNTHESIZER EFEK SUARA ROBOT EMO (PROCEDURAL PCM16 SFX)
   // =======================================================================
   void _playRobotSfx(String sfxType) {
     if (!enableRobotSfx || isVoiceAudioActive) return;
     if (sessionState == SessionState.speakingTts) return;
+    if (currentMusicianMode != MusicianMode.none) return;
 
     try {
       final int sr = _serverSampleRate;
@@ -352,7 +518,7 @@ class _PetHomeScreenState extends State<PetHomeScreen>
         for (int i = 0; i < count; i++) {
           final double progress = i / count;
           final double freq = fStart + (fEnd - fStart) * progress;
-          final double env = sin(progress * pi); // Smooth envelope
+          final double env = sin(progress * pi);
           phase += (2 * pi * freq) / sr;
           double val = sin(phase);
           if (square) val = val >= 0 ? 0.8 : -0.8;
@@ -363,7 +529,6 @@ class _PetHomeScreenState extends State<PetHomeScreen>
 
       switch (sfxType) {
         case 'shoot_and_die':
-          // Laser / Tembakan + Kaca Pecah + Power Down
           addTone(1500, 180, 140, volume: 0.45, noise: true);
           addTone(2400, 900, 90, volume: 0.35, noise: true);
           addTone(680, 140, 520, volume: 0.35, square: true);
@@ -373,12 +538,20 @@ class _PetHomeScreenState extends State<PetHomeScreen>
           addTone(580, 880, 130);
           addTone(880, 1320, 180);
           break;
+        case 'boop':
+          addTone(450, 980, 90);
+          addTone(980, 620, 70);
+          break;
+        case 'high_five':
+          addTone(1200, 400, 65, volume: 0.4, noise: true);
+          addTone(700, 1350, 120);
+          break;
         case 'happy':
         case 'laughing':
         case 'funny':
-          addTone(520, 780, 85);
-          addTone(680, 1050, 95);
-          addTone(850, 1280, 110);
+          addTone(520, 780, 80);
+          addTone(680, 1050, 85);
+          addTone(850, 1280, 100);
           break;
         case 'loving':
         case 'kissy':
@@ -398,10 +571,8 @@ class _PetHomeScreenState extends State<PetHomeScreen>
         case 'shocked':
           addTone(400, 1450, 160);
           break;
-        case 'thinking':
-        case 'confused':
-          addTone(540, 540, 70);
-          addTone(720, 640, 120);
+        case 'sleepy':
+          addTone(480, 240, 360, volume: 0.22);
           break;
         case 'dizzy':
           addTone(400, 800, 90);
@@ -420,7 +591,7 @@ class _PetHomeScreenState extends State<PetHomeScreen>
   }
 
   // =======================================================================
-  // 2. MODE BERMAIN: SHOOT & DIE + ANIMASI RETAK LAYAR
+  // 3. MODE BERMAIN: SHOOT & DIE + ANIMASI RETAK LAYAR
   // =======================================================================
   void _triggerShootAndDie({Offset? tapPosition}) {
     _reviveTimer?.cancel();
@@ -431,7 +602,6 @@ class _PetHomeScreenState extends State<PetHomeScreen>
     crackOrigin = center;
     crackBranches.clear();
 
-    // Buat 9 cabang garis kaca retak dari titik tembakan
     for (int i = 0; i < 9; i++) {
       final double baseAngle = (i * (2 * pi / 9)) + (rand.nextDouble() * 0.35);
       final List<Offset> branch = [center];
@@ -451,7 +621,6 @@ class _PetHomeScreenState extends State<PetHomeScreen>
     _playRobotSfx('shoot_and_die');
     _spawnParticle("💥", Colors.orangeAccent);
 
-    // Fase 1: Kaget angkat kedua tangan + Flash Putih + Layar Retak
     setState(() {
       isScreenCracked = true;
       shootFlashOpacity = 0.85;
@@ -464,18 +633,17 @@ class _PetHomeScreenState extends State<PetHomeScreen>
       if (mounted) setState(() => shootFlashOpacity = 0.0);
     });
 
-    // Fase 2: Tumbang & Ekspresi Mati (Mata X X + Lidah Keluar + Halo Malaikat)
     Future.delayed(const Duration(milliseconds: 650), () {
       if (!mounted) return;
       _spawnParticle("👻", Colors.white70);
       setState(() {
         currentEmotion = XiaoZhiEmotion.dead;
         currentHandGesture = HandGesture.deadDrop;
-        statusSubtitle = "💀 X_X ... $petName pura-pura mati... (Ketuk untuk bangunkan)";
+        statusSubtitle =
+            "💀 X_X ... $petName pura-pura mati... (Ketuk untuk bangunkan)";
       });
     });
 
-    // Fase 3: Bangkit Kembali Otomatis setelah 5.5 detik
     _reviveTimer = Timer(const Duration(milliseconds: 5500), () {
       if (mounted && currentEmotion == XiaoZhiEmotion.dead) {
         _reviveFromDead();
@@ -492,8 +660,7 @@ class _PetHomeScreenState extends State<PetHomeScreen>
       crackBranches.clear();
       currentEmotion = XiaoZhiEmotion.happy;
       currentHandGesture = HandGesture.peace;
-      statusSubtitle =
-          "Standby • Hehe aku hidup lagi! Panggil \"Hai $petName\"";
+      statusSubtitle = "Standby • Panggil \"Hai $petName\" untuk bicara";
     });
     _scheduleHandReset();
   }
@@ -563,7 +730,7 @@ class _PetHomeScreenState extends State<PetHomeScreen>
   }
 
   // =======================================================================
-  // 3. KAMERA VISION (DEFAULT SELFIE & BISA PINDAH DEPAN/BELAKANG)
+  // 4. KAMERA VISION (DEFAULT SELFIE & BISA PINDAH DEPAN/BELAKANG)
   // =======================================================================
   Future<void> _initCamerasAfterPermission({bool preferFront = true}) async {
     try {
@@ -640,7 +807,7 @@ class _PetHomeScreenState extends State<PetHomeScreen>
   }
 
   // =======================================================================
-  // 4. LOKASI GPS ASLI HP + CUACA REAL-TIME
+  // 5. LOKASI GPS ASLI HP + CUACA REAL-TIME
   // =======================================================================
   Future<void> _fetchHardwareGpsAndWeather() async {
     try {
@@ -716,7 +883,7 @@ class _PetHomeScreenState extends State<PetHomeScreen>
   }
 
   // =======================================================================
-  // 5. PROTOKOL OTA & WEBSOCKET XIAOZHI
+  // 6. PROTOKOL OTA & WEBSOCKET XIAOZHI
   // =======================================================================
   Future<void> _syncXiaoZhiOtaAndConnect(
       {bool showDialogIfPaired = false}) async {
@@ -740,7 +907,7 @@ class _PetHomeScreenState extends State<PetHomeScreen>
               "application": {
                 "name": "xiaozhi",
                 "version": "1.6.2",
-                "compile_time": "Oct 23 2026",
+                "compile_time": "Oct 24 2026",
                 "idf_version": "v5.3.2"
               },
               "board": {
@@ -866,9 +1033,12 @@ class _PetHomeScreenState extends State<PetHomeScreen>
         if (text.isNotEmpty && mounted) {
           _tryExtractPetNameFromServerText(text, isFromUser: true);
 
-          // Jika user mengucapkan kata tembakan saat ngobrol
           if (_isShootCommand(text)) {
             _triggerShootAndDie();
+            return;
+          }
+
+          if (_tryHandleVoiceMusicCommand(text)) {
             return;
           }
 
@@ -912,7 +1082,8 @@ class _PetHomeScreenState extends State<PetHomeScreen>
           Future.delayed(const Duration(milliseconds: 400), () {
             if (mounted &&
                 isXiaoZhiConnected &&
-                currentEmotion != XiaoZhiEmotion.dead) {
+                currentEmotion != XiaoZhiEmotion.dead &&
+                currentMusicianMode == MusicianMode.none) {
               _beginActiveOpusListening();
             }
           });
@@ -942,7 +1113,7 @@ class _PetHomeScreenState extends State<PetHomeScreen>
   }
 
   // =======================================================================
-  // 6. PROTOKOL MCP LENGKAP (VISION, GPS, VOLUME, & PLAY ACTION EMO)
+  // 7. PROTOKOL MCP LENGKAP (YOUTUBE MUSIC, VISION, GPS, PLAY ACTION)
   // =======================================================================
   Future<void> _handleMcpPayload(dynamic payload) async {
     if (payload == null) return;
@@ -958,15 +1129,41 @@ class _PetHomeScreenState extends State<PetHomeScreen>
       _sendMcpReply(id, {
         "protocolVersion": "2024-11-05",
         "capabilities": {"tools": {}},
-        "serverInfo": {"name": "XiaoZhi-EMO-Android-Pet", "version": "3.0.0"}
+        "serverInfo": {"name": "XiaoZhi-EMO-Android-Pet", "version": "4.0.0"}
       });
     } else if (method == 'tools/list') {
       _sendMcpReply(id, {
         "tools": [
           {
+            "name": "self.music.play_youtube",
+            "description":
+                "Play any song, music, or audio from YouTube while the pet performs an animated concert as a DJ, Guitarist, Pianist, or Vocalist.",
+            "inputSchema": {
+              "type": "object",
+              "properties": {
+                "query": {
+                  "type": "string",
+                  "description": "Song title, artist name, or music search query."
+                },
+                "style": {
+                  "type": "string",
+                  "enum": ["dj", "guitar", "piano", "vocal"],
+                  "description":
+                      "Performance style: 'dj' (turntable & headphones), 'guitar' (electric guitar), 'piano' (keyboard), or 'vocal' (stage mic)."
+                }
+              },
+              "required": ["query"]
+            }
+          },
+          {
+            "name": "self.music.stop_youtube",
+            "description": "Stop the currently playing YouTube music concert.",
+            "inputSchema": {"type": "object", "properties": {}}
+          },
+          {
             "name": "self.get_device_status",
             "description":
-                "Provides real-time device status including GPS location, city/district name, local weather, speaker volume, pet name, and active camera direction.",
+                "Provides real-time device status including GPS location, city/district name, local weather, speaker volume, pet name, music status, and active camera direction.",
             "inputSchema": {"type": "object", "properties": {}}
           },
           {
@@ -978,7 +1175,7 @@ class _PetHomeScreenState extends State<PetHomeScreen>
           {
             "name": "self.pet.play_action",
             "description":
-                "Trigger expressive robot pet animations, hand gestures, or play games like shoot_and_die (pretend to be shot with cracked screen and play dead), wave, peace, thumbs_up, angry_fists, or revive.",
+                "Trigger expressive robot pet animations, hand gestures, or play games like shoot_and_die (pretend to be shot with cracked screen and play dead), high_five, wave, peace, thumbs_up, angry_fists, or revive.",
             "inputSchema": {
               "type": "object",
               "properties": {
@@ -986,6 +1183,7 @@ class _PetHomeScreenState extends State<PetHomeScreen>
                   "type": "string",
                   "enum": [
                     "shoot_and_die",
+                    "high_five",
                     "wave",
                     "peace",
                     "thumbs_up",
@@ -1061,7 +1259,29 @@ class _PetHomeScreenState extends State<PetHomeScreen>
       final toolName = payload['params']?['name']?.toString() ?? "";
       final args = payload['params']?['arguments'] ?? {};
 
-      if (toolName == 'self.get_device_status' ||
+      if (toolName == 'self.music.play_youtube') {
+        final query = args['query']?.toString() ?? "Lofi hip hop beats";
+        final style = args['style']?.toString();
+        await _startYoutubeConcert(query, styleHint: style);
+        _sendMcpReply(id, {
+          "content": [
+            {
+              "type": "text",
+              "text":
+                  '{"success": true, "playing": "$query", "musician_mode": "${currentMusicianMode.name}"}'
+            }
+          ],
+          "isError": false
+        });
+      } else if (toolName == 'self.music.stop_youtube') {
+        await _stopYoutubeConcert();
+        _sendMcpReply(id, {
+          "content": [
+            {"type": "text", "text": '{"success": true, "status": "stopped"}'}
+          ],
+          "isError": false
+        });
+      } else if (toolName == 'self.get_device_status' ||
           toolName == 'self.location.get_current_location') {
         await _fetchHardwareGpsAndWeather();
         int vol = 80;
@@ -1072,6 +1292,11 @@ class _PetHomeScreenState extends State<PetHomeScreen>
         final statusJson = jsonEncode({
           "pet_name": petName,
           "audio_speaker": {"volume": vol},
+          "music_concert": {
+            "playing": currentMusicianMode != MusicianMode.none,
+            "mode": currentMusicianMode.name,
+            "song": currentSongTitle,
+          },
           "camera": {
             "active_lens": _currentLensName,
             "preview_visible": showCameraPreview
@@ -1106,6 +1331,10 @@ class _PetHomeScreenState extends State<PetHomeScreen>
           _triggerShootAndDie();
         } else if (action == 'revive') {
           _reviveFromDead();
+        } else if (action == 'high_five') {
+          _playRobotSfx('high_five');
+          _setEmotionWithGestureAndSfx(XiaoZhiEmotion.happy,
+              gesture: HandGesture.highFive);
         } else if (action == 'wave') {
           _setEmotionWithGestureAndSfx(XiaoZhiEmotion.happy,
               gesture: HandGesture.wave);
@@ -1248,7 +1477,7 @@ class _PetHomeScreenState extends State<PetHomeScreen>
   }
 
   // =======================================================================
-  // 7. WAKE WORD UNIVERSAL & DETEKSI SUARA TEMBAKAN ("DOR / TEMBAK / BANG")
+  // 8. WAKE WORD UNIVERSAL & DETEKSI SUARA TEMBAKAN / MUSIK
   // =======================================================================
   Future<void> _startWakeWordListener() async {
     if (sessionState != SessionState.standbyWakeWord) return;
@@ -1266,6 +1495,11 @@ class _PetHomeScreenState extends State<PetHomeScreen>
           if (_isShootCommand(spoken)) {
             _wakeStt.stop();
             _triggerShootAndDie();
+            return;
+          }
+
+          if (_tryHandleVoiceMusicCommand(spoken)) {
+            _wakeStt.stop();
             return;
           }
 
@@ -1420,6 +1654,9 @@ class _PetHomeScreenState extends State<PetHomeScreen>
     return XiaoZhiEmotion.neutral;
   }
 
+  // =======================================================================
+  // 9. INTERAKSI SENTUHAN FISIK LENGKAP (9 PHYSICAL TOUCH INTERACTIONS)
+  // =======================================================================
   void _initShakeDetector() {
     _accelSub = accelerometerEventStream().listen((AccelerometerEvent event) {
       double gForce =
@@ -1433,6 +1670,147 @@ class _PetHomeScreenState extends State<PetHomeScreen>
           _spawnParticle("💫", Colors.yellowAccent);
         }
       }
+    });
+  }
+
+  void _onFaceTapDown(TapDownDetails details, Size faceAreaSize) {
+    if (currentEmotion == XiaoZhiEmotion.dead) {
+      _reviveFromDead();
+      return;
+    }
+
+    final local = details.localPosition;
+    final centerX = faceAreaSize.width / 2;
+    final centerY = faceAreaSize.height / 2;
+
+    final leftEyeCenter = Offset(centerX - 72, centerY - 22);
+    final rightEyeCenter = Offset(centerX + 72, centerY - 22);
+    final noseCenter = Offset(centerX, centerY - 10);
+
+    // 1. Sentuhan Fisik: Colok Mata Kiri / Kanan
+    if ((local - leftEyeCenter).distance < 42 ||
+        (local - rightEyeCenter).distance < 42) {
+      _setEmotionWithGestureAndSfx(XiaoZhiEmotion.angry,
+          gesture: HandGesture.angryFists);
+      _spawnParticle("💢", Colors.redAccent);
+      setState(() => statusSubtitle = "😠 Aduh! Jangan colok mataku dong!");
+      return;
+    }
+
+    // 2. Sentuhan Fisik: Pencet Hidung (Nose Boop) di tengah antara kedua mata
+    if ((local - noseCenter).distance < 32) {
+      _playRobotSfx('boop');
+      _spawnParticle("😜", Colors.amberAccent);
+      setState(() {
+        isCrossEyed = true;
+        currentEmotion = XiaoZhiEmotion.silly;
+        statusSubtitle = "😜 Boop! Hidungku dipencet jadi juling nih!";
+      });
+      Future.delayed(const Duration(seconds: 2), () {
+        if (mounted) setState(() => isCrossEyed = false);
+      });
+      return;
+    }
+
+    // Jika sedang memutar konser musik YouTube, ketuk bawah untuk ganti instrumen
+    if (currentMusicianMode != MusicianMode.none && local.dy > centerY + 40) {
+      _cycleMusicianStyle();
+      return;
+    }
+
+    if (sessionState != SessionState.standbyWakeWord) {
+      _returnToStandbyMode();
+    } else {
+      _triggerWakeUpToXiaoZhi("Hai $petName");
+    }
+  }
+
+  void _onFaceLongPress() {
+    // 3. Sentuhan Fisik: Tekan Lama -> Menguap & Tidur
+    if (currentEmotion == XiaoZhiEmotion.dead) return;
+    _playRobotSfx('sleepy');
+    _spawnParticle("💤", Colors.cyanAccent);
+    setState(() {
+      currentEmotion = XiaoZhiEmotion.sleepy;
+      currentHandGesture = HandGesture.none;
+      statusSubtitle = "😴 Hoaaam... ngantuk sekali... Zzz...";
+    });
+  }
+
+  void _onFacePanUpdate(DragUpdateDetails details, Size faceAreaSize) {
+    if (currentEmotion == XiaoZhiEmotion.dead) return;
+    final local = details.localPosition;
+    final dx = ((local.dx / faceAreaSize.width) - 0.5) * 2.0;
+    final dy = ((local.dy / faceAreaSize.height) - 0.5) * 2.0;
+
+    setState(() {
+      gazeOffset = Offset(dx.clamp(-1.0, 1.0), dy.clamp(-1.0, 1.0));
+    });
+
+    // 4. Sentuhan Fisik: Elus Dahi / Kepala Atas (dy < -0.18)
+    if (dy < -0.18) {
+      rubCounter++;
+      if (rubCounter % 12 == 0) {
+        _spawnParticle("❤️", Colors.pinkAccent);
+        _setEmotionWithGestureAndSfx(XiaoZhiEmotion.loving,
+            gesture: HandGesture.coverCheeks);
+        setState(
+            () => statusSubtitle = "😍 Nyaman banget kepalaku dielus-elus...");
+      }
+      return;
+    }
+
+    // 5. Sentuhan Fisik: Gelitik Dagu / Perut Bawah (dy > 0.22)
+    if (dy > 0.22 && details.delta.dx.abs() > 2.5) {
+      tickleCounter++;
+      setState(() {
+        tickleShakeOffset = (tickleCounter.isEven ? 9.0 : -9.0);
+      });
+      if (tickleCounter % 10 == 0) {
+        _spawnParticle("😆", Colors.amberAccent);
+        _setEmotionWithGestureAndSfx(XiaoZhiEmotion.laughing,
+            gesture: HandGesture.peace);
+        setState(
+            () => statusSubtitle = "😆 Hahaha geli tau! Jangan digelitikin!");
+      }
+      return;
+    }
+
+    // 6. Sentuhan Fisik: Tarik Pipi Kiri / Kanan (|dx| > 0.45)
+    if (dx.abs() > 0.42 && dy.abs() < 0.25) {
+      setState(() {
+        cheekStretchX = (1.0 + (dx.abs() - 0.42) * 0.45).clamp(1.0, 1.28);
+        currentEmotion = XiaoZhiEmotion.embarrassed;
+        statusSubtitle = "😳 Uwaaa pipiku ditarik-tarik jadi melar!";
+      });
+    }
+  }
+
+  void _onFacePanEnd(DragEndDetails details) {
+    rubCounter = 0;
+    tickleCounter = 0;
+
+    // 7. Sentuhan Fisik: Swipe Cepat untuk High-Five (Tos!)
+    final velocity = details.velocity.pixelsPerSecond.distance;
+    if (velocity > 1100 && cheekStretchX == 1.0) {
+      if (currentMusicianMode != MusicianMode.none) {
+        _cycleMusicianStyle();
+      } else {
+        _playRobotSfx('high_five');
+        _spawnParticle("🙌", Colors.cyanAccent);
+        _setEmotionWithGestureAndSfx(XiaoZhiEmotion.happy,
+            gesture: HandGesture.highFive);
+        setState(() => statusSubtitle = "🙌 TOS!! High-Five sama $petName!");
+      }
+    }
+
+    setState(() {
+      cheekStretchX = 1.0;
+      tickleShakeOffset = 0.0;
+    });
+
+    Future.delayed(const Duration(seconds: 1), () {
+      if (mounted) setState(() => gazeOffset = Offset.zero);
     });
   }
 
@@ -1455,6 +1833,13 @@ class _PetHomeScreenState extends State<PetHomeScreen>
     if (!mounted || currentEmotion == XiaoZhiEmotion.dead) return;
     _blinkController.forward().then((_) => _blinkController.reverse());
 
+    if (currentMusicianMode != MusicianMode.none) {
+      _spawnParticle(Random().nextBool() ? "🎵" : "🎶",
+          themeColors[Random().nextInt(themeColors.length)]);
+    } else if (currentEmotion == XiaoZhiEmotion.sleepy) {
+      _spawnParticle("Zzz", Colors.cyanAccent);
+    }
+
     final rand = Random();
     if (rand.nextBool()) {
       setState(() {
@@ -1474,8 +1859,8 @@ class _PetHomeScreenState extends State<PetHomeScreen>
       particles.add(
         FloatingParticle(
           position: Offset(
-            110 + rand.nextDouble() * 110,
-            35 + rand.nextDouble() * 55,
+            90 + rand.nextDouble() * 140,
+            30 + rand.nextDouble() * 60,
           ),
           symbol: symbol,
           color: color,
@@ -1509,67 +1894,13 @@ class _PetHomeScreenState extends State<PetHomeScreen>
     }
   }
 
-  void _onFaceTapDown(TapDownDetails details, Size faceAreaSize) {
-    if (currentEmotion == XiaoZhiEmotion.dead) {
-      _reviveFromDead();
-      return;
-    }
-
-    final local = details.localPosition;
-    final centerX = faceAreaSize.width / 2;
-    final centerY = faceAreaSize.height / 2;
-
-    final leftEyeCenter = Offset(centerX - 75, centerY - 20);
-    final rightEyeCenter = Offset(centerX + 75, centerY - 20);
-
-    if ((local - leftEyeCenter).distance < 45 ||
-        (local - rightEyeCenter).distance < 45) {
-      _setEmotionWithGestureAndSfx(XiaoZhiEmotion.angry,
-          gesture: HandGesture.angryFists);
-      _spawnParticle("💢", Colors.redAccent);
-      return;
-    }
-
-    if (sessionState != SessionState.standbyWakeWord) {
-      _returnToStandbyMode();
-    } else {
-      _triggerWakeUpToXiaoZhi("Hai $petName");
-    }
-  }
-
-  void _onFacePanUpdate(DragUpdateDetails details, Size faceAreaSize) {
-    if (currentEmotion == XiaoZhiEmotion.dead) return;
-    final local = details.localPosition;
-    final dx = ((local.dx / faceAreaSize.width) - 0.5) * 2.0;
-    final dy = ((local.dy / faceAreaSize.height) - 0.5) * 2.0;
-
-    setState(() {
-      gazeOffset = Offset(dx.clamp(-1.0, 1.0), dy.clamp(-1.0, 1.0));
-    });
-
-    if (dy < -0.15) {
-      rubCounter++;
-      if (rubCounter % 14 == 0) {
-        _spawnParticle("❤️", Colors.pinkAccent);
-        _setEmotionWithGestureAndSfx(XiaoZhiEmotion.loving,
-            gesture: HandGesture.coverCheeks);
-      }
-    }
-  }
-
-  void _onFacePanEnd(DragEndDetails details) {
-    rubCounter = 0;
-    Future.delayed(const Duration(seconds: 1), () {
-      if (mounted) setState(() => gazeOffset = Offset.zero);
-    });
-  }
-
   @override
   void dispose() {
     _blinkController.dispose();
     _floatController.dispose();
     _talkController.dispose();
     _handController.dispose();
+    _beatController.dispose();
     _clockTimer?.cancel();
     _idleTimer?.cancel();
     _particleTimer?.cancel();
@@ -1602,7 +1933,7 @@ class _PetHomeScreenState extends State<PetHomeScreen>
           children: [
             Column(
               children: [
-                // HUD Bar Atas
+                // HUD Bar Atas (Bersih Tanpa Shortcut Ekspresi)
                 Padding(
                   padding:
                       const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
@@ -1687,12 +2018,13 @@ class _PetHomeScreenState extends State<PetHomeScreen>
                       ),
                       Row(
                         children: [
-                          IconButton(
-                            icon: const Icon(Icons.gps_fixed,
-                                color: Colors.redAccent, size: 22),
-                            tooltip: "Main Shoot & Die (Tembak Pet!)",
-                            onPressed: () => _triggerShootAndDie(),
-                          ),
+                          if (currentMusicianMode != MusicianMode.none)
+                            IconButton(
+                              icon: const Icon(Icons.music_off,
+                                  color: Colors.amberAccent, size: 22),
+                              tooltip: "Matikan Musik YouTube",
+                              onPressed: _stopYoutubeConcert,
+                            ),
                           IconButton(
                             icon: Icon(
                               showCameraPreview
@@ -1733,7 +2065,7 @@ class _PetHomeScreenState extends State<PetHomeScreen>
                   ),
                 ),
 
-                // Area Wajah EMO Vektor + Alis + Tangan/Jari Ekspresif
+                // Area Wajah EMO + Sentuhan Fisik + Panggung Musisi (DJ/Gitar/Piano/Vokal)
                 Expanded(
                   child: LayoutBuilder(
                     builder: (context, constraints) {
@@ -1742,6 +2074,7 @@ class _PetHomeScreenState extends State<PetHomeScreen>
                       return GestureDetector(
                         behavior: HitTestBehavior.opaque,
                         onTapDown: (d) => _onFaceTapDown(d, size),
+                        onLongPress: _onFaceLongPress,
                         onDoubleTapDown: (d) =>
                             _triggerShootAndDie(tapPosition: d.localPosition),
                         onDoubleTap: () {},
@@ -1756,29 +2089,55 @@ class _PetHomeScreenState extends State<PetHomeScreen>
                                 _floatController,
                                 _talkController,
                                 _handController,
+                                _beatController,
                               ]),
                               builder: (context, child) {
                                 final double activeTalk = isVoiceAudioActive
                                     ? _talkController.value
                                     : 0.0;
+                                final double beatVal =
+                                    currentMusicianMode != MusicianMode.none
+                                        ? _beatController.value
+                                        : 0.0;
+
+                                // Goyang badan mengikuti irama saat mode Musisi aktif
+                                final double grooveY = currentMusicianMode !=
+                                        MusicianMode.none
+                                    ? (beatVal - 0.5) * 22
+                                    : (_floatController.value - 0.5) * 14;
+                                final double grooveX =
+                                    currentMusicianMode == MusicianMode.piano
+                                        ? sin(beatVal * pi * 2) * 14
+                                        : tickleShakeOffset;
 
                                 return Transform.translate(
                                   offset: Offset(
-                                    gazeOffset.dx * 12,
-                                    (_floatController.value - 0.5) * 14 +
-                                        gazeOffset.dy * 8,
+                                    gazeOffset.dx * 12 + grooveX,
+                                    grooveY + gazeOffset.dy * 8,
                                   ),
-                                  child: CustomPaint(
-                                    size: const Size(360, 270),
-                                    painter: EmoRobotFaceAndHandsPainter(
-                                      emotion: currentEmotion,
-                                      handGesture: currentHandGesture,
-                                      blinkValue: _blinkController.value,
-                                      isTalking: isVoiceAudioActive,
-                                      talkValue: activeTalk,
-                                      handAnimValue: _handController.value,
-                                      gazeOffset: gazeOffset,
-                                      faceColor: baseColor,
+                                  child: Transform.scale(
+                                    scaleX: cheekStretchX,
+                                    scaleY: 1.0 - ((cheekStretchX - 1.0) * 0.25),
+                                    child: CustomPaint(
+                                      size: const Size(360, 310),
+                                      painter: EmoRobotFaceAndHandsPainter(
+                                        emotion: currentEmotion,
+                                        handGesture: currentHandGesture,
+                                        musicianMode: currentMusicianMode,
+                                        blinkValue: _blinkController.value,
+                                        isTalking: isVoiceAudioActive ||
+                                            currentMusicianMode ==
+                                                MusicianMode.vocal,
+                                        talkValue: currentMusicianMode ==
+                                                MusicianMode.vocal
+                                            ? beatVal
+                                            : activeTalk,
+                                        handAnimValue: _handController.value,
+                                        beatValue: beatVal,
+                                        isCrossEyed: isCrossEyed,
+                                        gazeOffset: gazeOffset,
+                                        faceColor: baseColor,
+                                      ),
                                     ),
                                   ),
                                 );
@@ -1808,70 +2167,27 @@ class _PetHomeScreenState extends State<PetHomeScreen>
                   ),
                 ),
 
-                // Bar Tes Cepat Ekspresi & Gestur Tangan EMO
-                SingleChildScrollView(
-                  scrollDirection: Axis.horizontal,
-                  padding:
-                      const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
-                  child: Row(
-                    children: [
-                      _buildActionChip("💥 TEMBAK!", () => _triggerShootAndDie()),
-                      _buildActionChip(
-                          "👋 Sapa",
-                          () => _setEmotionWithGestureAndSfx(
-                              XiaoZhiEmotion.happy,
-                              gesture: HandGesture.wave)),
-                      _buildActionChip(
-                          "✌️ Peace",
-                          () => _setEmotionWithGestureAndSfx(
-                              XiaoZhiEmotion.winking,
-                              gesture: HandGesture.peace)),
-                      _buildActionChip(
-                          "😎 Cool",
-                          () => _setEmotionWithGestureAndSfx(
-                              XiaoZhiEmotion.cool,
-                              gesture: HandGesture.thumbsUp)),
-                      _buildActionChip(
-                          "🤔 Mikir",
-                          () => _setEmotionWithGestureAndSfx(
-                              XiaoZhiEmotion.thinking,
-                              gesture: HandGesture.thinkingChin)),
-                      _buildActionChip(
-                          "😠 Marah",
-                          () => _setEmotionWithGestureAndSfx(
-                              XiaoZhiEmotion.angry,
-                              gesture: HandGesture.angryFists)),
-                      _buildActionChip(
-                          "😭 Nangis",
-                          () => _setEmotionWithGestureAndSfx(
-                              XiaoZhiEmotion.crying)),
-                      _buildActionChip(
-                          "😍 Sayang",
-                          () => _setEmotionWithGestureAndSfx(
-                              XiaoZhiEmotion.loving,
-                              gesture: HandGesture.coverCheeks)),
-                    ],
-                  ),
-                ),
-
-                // Indikator Status & Subtitle XiaoZhi
+                // Indikator Status & Subtitle Percakapan XiaoZhi
                 Padding(
-                  padding: const EdgeInsets.only(
-                      bottom: 18, left: 24, right: 24, top: 6),
+                  padding:
+                      const EdgeInsets.only(bottom: 22, left: 24, right: 24),
                   child: Container(
                     width: double.infinity,
                     padding: const EdgeInsets.symmetric(
-                        horizontal: 20, vertical: 13),
+                        horizontal: 20, vertical: 14),
                     decoration: BoxDecoration(
                       color: Colors.white.withOpacity(0.07),
                       borderRadius: BorderRadius.circular(22),
                       border: Border.all(
-                        color: sessionState == SessionState.listeningToUser
-                            ? Colors.greenAccent
-                            : isVoiceAudioActive
-                                ? Colors.cyanAccent
-                                : Colors.white24,
-                        width: sessionState == SessionState.standbyWakeWord
+                        color: currentMusicianMode != MusicianMode.none
+                            ? Colors.amberAccent
+                            : sessionState == SessionState.listeningToUser
+                                ? Colors.greenAccent
+                                : isVoiceAudioActive
+                                    ? Colors.cyanAccent
+                                    : Colors.white24,
+                        width: sessionState == SessionState.standbyWakeWord &&
+                                currentMusicianMode == MusicianMode.none
                             ? 1
                             : 2,
                       ),
@@ -1886,7 +2202,7 @@ class _PetHomeScreenState extends State<PetHomeScreen>
               ],
             ),
 
-            // Overlay Retak Layar Kaca (Saat Mode Shoot & Die)
+            // Overlay Retak Layar Kaca (Saat Double Tap / Shoot & Die)
             if (isScreenCracked)
               IgnorePointer(
                 child: CustomPaint(
@@ -1912,7 +2228,7 @@ class _PetHomeScreenState extends State<PetHomeScreen>
                 _cameraController!.value.isInitialized)
               Positioned(
                 right: 16,
-                bottom: 130,
+                bottom: 95,
                 child: GestureDetector(
                   onTap: () => _switchCameraLens(),
                   child: Container(
@@ -1975,17 +2291,6 @@ class _PetHomeScreenState extends State<PetHomeScreen>
     );
   }
 
-  Widget _buildActionChip(String label, VoidCallback onTap) {
-    return Padding(
-      padding: const EdgeInsets.only(right: 8),
-      child: ActionChip(
-        label: Text(label, style: const TextStyle(fontSize: 11)),
-        backgroundColor: Colors.white.withOpacity(0.08),
-        onPressed: onTap,
-      ),
-    );
-  }
-
   void _showPairingDialog(String code, String? serverMsg) {
     showDialog(
       context: context,
@@ -2037,7 +2342,6 @@ class _PetHomeScreenState extends State<PetHomeScreen>
     );
   }
 
-  // Menu Pengaturan Bersih (Tanpa Input Nama Pet & Tanpa Saklar Emoji)
   void _showVisualSettingsDialog() {
     int selectedColor = themeColorIndex;
     bool tempSfx = enableRobotSfx;
@@ -2075,14 +2379,14 @@ class _PetHomeScreenState extends State<PetHomeScreen>
                 title: const Text("Efek Suara Ekspresi (SFX Robot)",
                     style: TextStyle(fontSize: 13)),
                 subtitle: const Text(
-                    "Bunyi chirp, beep, & efek suara saat ganti ekspresi/bermain",
+                    "Bunyi chirp, beep, & efek suara saat sentuhan fisik",
                     style: TextStyle(fontSize: 11)),
                 value: tempSfx,
                 onChanged: (v) => setDialogState(() => tempSfx = v),
               ),
               const Divider(),
               Text(
-                "Nama Pet (Sync Server): $petName\nLokasi GPS: $locationName\nMAC Address: $deviceMac",
+                "Nama Pet (Otomatis Server): $petName\nLokasi GPS: $locationName\nMAC Address: $deviceMac",
                 style: const TextStyle(fontSize: 11, color: Colors.white54),
               ),
             ],
@@ -2113,25 +2417,31 @@ class _PetHomeScreenState extends State<PetHomeScreen>
 }
 
 // =========================================================================
-// PAINTER 1: WAJAH ROBOT EMO + ALIS ARTIKULASI + TANGAN & JARI EKSPRESIF
+// PAINTER UTAMA: WAJAH EMO + TANGAN/JARI + PANGGUNG MUSISI (DJ/GITAR/PIANO/VOKAL)
 // =========================================================================
 class EmoRobotFaceAndHandsPainter extends CustomPainter {
   final XiaoZhiEmotion emotion;
   final HandGesture handGesture;
+  final MusicianMode musicianMode;
   final double blinkValue;
   final bool isTalking;
   final double talkValue;
   final double handAnimValue;
+  final double beatValue;
+  final bool isCrossEyed;
   final Offset gazeOffset;
   final Color faceColor;
 
   EmoRobotFaceAndHandsPainter({
     required this.emotion,
     required this.handGesture,
+    required this.musicianMode,
     required this.blinkValue,
     required this.isTalking,
     required this.talkValue,
     required this.handAnimValue,
+    required this.beatValue,
+    required this.isCrossEyed,
     required this.gazeOffset,
     required this.faceColor,
   });
@@ -2146,18 +2456,41 @@ class EmoRobotFaceAndHandsPainter extends CustomPainter {
       ..color = faceColor.withOpacity(0.32)
       ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 18);
 
-    double eyeWidth = 66;
-    double eyeHeight = 80 * (1.0 - blinkValue * 0.92);
+    double eyeWidth = 64;
+    double eyeHeight = 76 * (1.0 - blinkValue * 0.92);
 
     final gazeShift = Offset(gazeOffset.dx * 16, gazeOffset.dy * 12);
-    final leftCenter =
-        Offset(size.width * 0.30, size.height * 0.44) + gazeShift;
-    final rightCenter =
-        Offset(size.width * 0.70, size.height * 0.44) + gazeShift;
+    // Jika Nose Boop (isCrossEyed), kedua mata juling mendekat ke tengah
+    final Offset leftCross = isCrossEyed ? const Offset(22, 6) : Offset.zero;
+    final Offset rightCross = isCrossEyed ? const Offset(-22, 6) : Offset.zero;
 
-    // 1. Jika Mode DEAD (Mati setelah ditembak), gambar Cincin Halo Malaikat di atas kepala
+    final leftCenter =
+        Offset(size.width * 0.30, size.height * 0.38) + gazeShift + leftCross;
+    final rightCenter =
+        Offset(size.width * 0.70, size.height * 0.38) + gazeShift + rightCross;
+
+    // 0. Jika Mode VOKALIS, gambar Lampu Sorot Panggung dari Atas
+    if (musicianMode == MusicianMode.vocal) {
+      final spotPath = Path()
+        ..moveTo(size.width * 0.35, 0)
+        ..lineTo(size.width * 0.65, 0)
+        ..lineTo(size.width * 0.92, size.height)
+        ..lineTo(size.width * 0.08, size.height)
+        ..close();
+      canvas.drawPath(
+        spotPath,
+        Paint()..color = faceColor.withOpacity(0.08 + beatValue * 0.06),
+      );
+    }
+
+    // 1. Jika Mode DJ, gambar Headphone Neon Besar di Kepala Pet
+    if (musicianMode == MusicianMode.dj) {
+      _drawDjHeadphones(canvas, size, paint, glowPaint);
+    }
+
+    // 2. Jika Mode DEAD, gambar Cincin Halo Malaikat di atas kepala
     if (emotion == XiaoZhiEmotion.dead) {
-      final haloCenter = Offset(size.width * 0.5, size.height * 0.11);
+      final haloCenter = Offset(size.width * 0.5, size.height * 0.09);
       final haloGlow = Paint()
         ..color = Colors.amberAccent.withOpacity(0.5)
         ..style = PaintingStyle.stroke
@@ -2168,23 +2501,23 @@ class EmoRobotFaceAndHandsPainter extends CustomPainter {
         ..style = PaintingStyle.stroke
         ..strokeWidth = 5;
       canvas.drawOval(
-          Rect.fromCenter(center: haloCenter, width: 110, height: 26),
+          Rect.fromCenter(center: haloCenter, width: 110, height: 24),
           haloGlow);
       canvas.drawOval(
-          Rect.fromCenter(center: haloCenter, width: 110, height: 26),
+          Rect.fromCenter(center: haloCenter, width: 110, height: 24),
           haloStroke);
     }
 
-    // 2. Gambar Alis Mata Dinamis di atas kedua mata (Gaya EMO Pet)
+    // 3. Gambar Alis Mata Dinamis
     _drawEyebrows(canvas, leftCenter, rightCenter, eyeWidth);
 
-    // 3. Gambar Kedua Bola Mata
+    // 4. Gambar Kedua Bola Mata
     _drawCustomEye(
         canvas, leftCenter, eyeWidth, eyeHeight, paint, glowPaint, true);
     _drawCustomEye(
         canvas, rightCenter, eyeWidth, eyeHeight, paint, glowPaint, false);
 
-    // 4. Pipi Merona
+    // 5. Pipi Merona
     if (emotion == XiaoZhiEmotion.loving ||
         emotion == XiaoZhiEmotion.kissy ||
         emotion == XiaoZhiEmotion.happy ||
@@ -2195,51 +2528,306 @@ class EmoRobotFaceAndHandsPainter extends CustomPainter {
         ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 10);
       canvas.drawOval(
         Rect.fromCenter(
-            center: leftCenter.translate(-18, 50), width: 34, height: 16),
+            center: leftCenter.translate(-18, 48), width: 34, height: 16),
         blushPaint,
       );
       canvas.drawOval(
         Rect.fromCenter(
-            center: rightCenter.translate(18, 50), width: 34, height: 16),
+            center: rightCenter.translate(18, 48), width: 34, height: 16),
         blushPaint,
       );
     }
 
-    // 5. Genangan Air Mata
+    // 6. Genangan Air Mata
     if (emotion == XiaoZhiEmotion.crying) {
       final tearPaint = Paint()..color = Colors.lightBlueAccent;
       final double tearOffset = handAnimValue * 10;
       canvas.drawOval(
         Rect.fromCenter(
-            center: leftCenter.translate(-6, 52 + tearOffset),
+            center: leftCenter.translate(-6, 50 + tearOffset),
             width: 12,
             height: 22),
         tearPaint,
       );
       canvas.drawOval(
         Rect.fromCenter(
-            center: rightCenter.translate(6, 52 + tearOffset),
+            center: rightCenter.translate(6, 50 + tearOffset),
             width: 12,
             height: 22),
         tearPaint,
       );
     }
 
-    // 6. Kacamata Visor Cool
-    if (emotion == XiaoZhiEmotion.cool) {
+    // 7. Kacamata Visor Cool (Aktif saat Cool atau Mode DJ/Gitaris)
+    if (emotion == XiaoZhiEmotion.cool ||
+        musicianMode == MusicianMode.dj ||
+        musicianMode == MusicianMode.guitar) {
       final bridgePaint = Paint()
         ..color = faceColor
         ..strokeWidth = 6
         ..style = PaintingStyle.stroke;
-      canvas.drawLine(leftCenter.translate(32, -8),
-          rightCenter.translate(-32, -8), bridgePaint);
+      canvas.drawLine(leftCenter.translate(30, -8),
+          rightCenter.translate(-30, -8), bridgePaint);
     }
 
-    // 7. Gambar Mulut Anti-Tumpuk
+    // 8. Gambar Mulut Anti-Tumpuk
     _drawMouth(canvas, size, gazeShift * 0.5);
 
-    // 8. Gambar Tangan & Jari Robot Ekspresif
-    _drawExpressiveHands(canvas, size, paint, glowPaint);
+    // 9. Jika sedang Mode Musisi (DJ / Gitar / Piano / Vokal), gambar Instrumen & Tangan Musisi
+    if (musicianMode != MusicianMode.none) {
+      _drawMusicianStageAndHands(canvas, size, paint, glowPaint);
+    } else {
+      // Gambar Tangan & Jari Ekspresif Reguler
+      _drawExpressiveHands(canvas, size, paint, glowPaint);
+    }
+  }
+
+  void _drawDjHeadphones(
+      Canvas canvas, Size size, Paint fillPaint, Paint glowPaint) {
+    final bandPaint = Paint()
+      ..color = faceColor
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 10
+      ..strokeCap = StrokeCap.round;
+
+    final arcRect = Rect.fromCenter(
+      center: Offset(size.width * 0.5, size.height * 0.36),
+      width: size.width * 0.72,
+      height: size.height * 0.55,
+    );
+    canvas.drawArc(arcRect, pi * 1.05, pi * 0.9, false, glowPaint);
+    canvas.drawArc(arcRect, pi * 1.05, pi * 0.9, false, bandPaint);
+
+    // Earcup Kiri & Kanan berkedip sesuai beat
+    final double cupPulse = 4.0 * beatValue;
+    final leftCup = RRect.fromRectAndRadius(
+      Rect.fromCenter(
+          center: Offset(size.width * 0.12, size.height * 0.38),
+          width: 26 + cupPulse,
+          height: 64 + cupPulse),
+      const Radius.circular(14),
+    );
+    final rightCup = RRect.fromRectAndRadius(
+      Rect.fromCenter(
+          center: Offset(size.width * 0.88, size.height * 0.38),
+          width: 26 + cupPulse,
+          height: 64 + cupPulse),
+      const Radius.circular(14),
+    );
+    canvas.drawRRect(leftCup, glowPaint);
+    canvas.drawRRect(leftCup, fillPaint);
+    canvas.drawRRect(rightCup, glowPaint);
+    canvas.drawRRect(rightCup, fillPaint);
+  }
+
+  void _drawMusicianStageAndHands(
+      Canvas canvas, Size size, Paint fillPaint, Paint glowPaint) {
+    final strokePaint = Paint()
+      ..color = faceColor
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 5
+      ..strokeCap = StrokeCap.round;
+
+    switch (musicianMode) {
+      case MusicianMode.dj:
+        // Meja DJ Turntable + 2 Vinyl Berputar + Equalizer Bars
+        final deckRect = RRect.fromRectAndRadius(
+          Rect.fromCenter(
+              center: Offset(size.width * 0.5, size.height * 0.88),
+              width: size.width * 0.84,
+              height: 58),
+          const Radius.circular(16),
+        );
+        canvas.drawRRect(
+            deckRect, Paint()..color = Colors.white.withOpacity(0.08));
+        canvas.drawRRect(deckRect, strokePaint);
+
+        // Equalizer LED Bars di tengah deck
+        for (int i = 0; i < 7; i++) {
+          final double barH =
+              10.0 + ((sin((beatValue + i * 0.3) * pi * 2) + 1) * 14);
+          final double bx = size.width * 0.38 + (i * 14.0);
+          canvas.drawRRect(
+            RRect.fromRectAndRadius(
+              Rect.fromCenter(
+                  center: Offset(bx, size.height * 0.88),
+                  width: 8,
+                  height: barH),
+              const Radius.circular(4),
+            ),
+            Paint()
+              ..color = i.isEven ? Colors.cyanAccent : Colors.pinkAccent,
+          );
+        }
+
+        // 2 Piringan Hitam (Vinyl Discs)
+        final leftDisc = Offset(size.width * 0.24, size.height * 0.88);
+        final rightDisc = Offset(size.width * 0.76, size.height * 0.88);
+        canvas.drawCircle(leftDisc, 24, strokePaint);
+        canvas.drawCircle(leftDisc, 8, fillPaint);
+        canvas.drawCircle(rightDisc, 24, strokePaint);
+        canvas.drawCircle(rightDisc, 8, fillPaint);
+
+        // Tangan Kiri pegang Headphone, Tangan Kanan Scratching Vinyl
+        _drawPalmWithFingers(
+          canvas,
+          Offset(size.width * 0.14, size.height * 0.44),
+          fillPaint,
+          glowPaint,
+          fingerAngles: [0.2, 0.5],
+          fingerLengths: [18, 18],
+        );
+        final double scratchShift = (handAnimValue - 0.5) * 26;
+        _drawPalmWithFingers(
+          canvas,
+          Offset(size.width * 0.76 + scratchShift, size.height * 0.82),
+          fillPaint,
+          glowPaint,
+          fingerAngles: [2.8, 3.1, 3.4],
+          fingerLengths: [20, 22, 20],
+        );
+        break;
+
+      case MusicianMode.guitar:
+        // Gitar Elektrik Neon Melintang + Leher Fretboard + 6 Senar
+        final bodyCenter = Offset(size.width * 0.38, size.height * 0.84);
+        final neckEnd = Offset(size.width * 0.88, size.height * 0.64);
+
+        // Leher Gitar
+        final neckPaint = Paint()
+          ..color = faceColor
+          ..strokeWidth = 16
+          ..strokeCap = StrokeCap.round;
+        canvas.drawLine(bodyCenter, neckEnd, glowPaint);
+        canvas.drawLine(bodyCenter, neckEnd, neckPaint);
+
+        // Bodi Gitar Elektrik
+        final guitarBody = RRect.fromRectAndRadius(
+          Rect.fromCenter(center: bodyCenter, width: 96, height: 52),
+          const Radius.circular(24),
+        );
+        canvas.drawRRect(guitarBody, glowPaint);
+        canvas.drawRRect(guitarBody, fillPaint);
+        canvas.drawCircle(
+            bodyCenter, 14, Paint()..color = Colors.black.withOpacity(0.7));
+
+        // Tangan Kanan Strumming (Menggenjreng Senar) Naik-Turun Cepat
+        final double strumY = (beatValue - 0.5) * 28;
+        _drawPalmWithFingers(
+          canvas,
+          Offset(bodyCenter.dx - 10, bodyCenter.dy - 12 + strumY),
+          fillPaint,
+          glowPaint,
+          fingerAngles: [2.6, 3.0, 3.3],
+          fingerLengths: [20, 22, 18],
+        );
+
+        // Tangan Kiri Geser Kunci Kord di Leher Gitar
+        final double chordSlide = (handAnimValue - 0.5) * 24;
+        _drawPalmWithFingers(
+          canvas,
+          Offset(size.width * 0.72 + chordSlide, size.height * 0.70),
+          fillPaint,
+          glowPaint,
+          fingerAngles: [-0.3, 0.0, 0.3],
+          fingerLengths: [20, 22, 20],
+        );
+        break;
+
+      case MusicianMode.piano:
+        // Deretan Tuts Piano Neon di Bawah Wajah
+        final double pianoTop = size.height * 0.82;
+        final double pianoWidth = size.width * 0.84;
+        final double startX = size.width * 0.08;
+        final int keyCount = 10;
+        final double keyW = pianoWidth / keyCount;
+
+        for (int i = 0; i < keyCount; i++) {
+          final bool isPressed =
+              ((beatValue * keyCount).floor() % keyCount) == i ||
+                  (((1.0 - handAnimValue) * keyCount).floor() % keyCount) == i;
+          final keyRect = RRect.fromRectAndRadius(
+            Rect.fromLTWH(
+                startX + i * keyW + 2, pianoTop, keyW - 4, isPressed ? 42 : 48),
+            const Radius.circular(6),
+          );
+          canvas.drawRRect(
+            keyRect,
+            Paint()
+              ..color = isPressed
+                  ? faceColor
+                  : Colors.white.withOpacity(0.85),
+          );
+        }
+
+        // Kedua Tangan Menari Kiri-Kanan Menekan Tuts Piano
+        final double leftHandX =
+            size.width * 0.28 + sin(handAnimValue * pi * 2) * 38;
+        final double rightHandX =
+            size.width * 0.72 + cos(beatValue * pi * 2) * 38;
+        _drawPalmWithFingers(
+          canvas,
+          Offset(leftHandX, pianoTop - 10 + (beatValue * 8)),
+          fillPaint,
+          glowPaint,
+          fingerAngles: [2.7, 3.0, 3.3, 3.6],
+          fingerLengths: [20, 24, 24, 18],
+        );
+        _drawPalmWithFingers(
+          canvas,
+          Offset(rightHandX, pianoTop - 10 + ((1 - beatValue) * 8)),
+          fillPaint,
+          glowPaint,
+          fingerAngles: [2.7, 3.0, 3.3, 3.6],
+          fingerLengths: [20, 24, 24, 18],
+        );
+        break;
+
+      case MusicianMode.vocal:
+        // Stand Mikrofon Panggung + Kepala Mic Neon di Depan Mulut
+        final micHead = Offset(size.width * 0.56, size.height * 0.78);
+        final standBottom = Offset(size.width * 0.62, size.height * 0.98);
+        canvas.drawLine(
+          micHead,
+          standBottom,
+          Paint()
+            ..color = Colors.white70
+            ..strokeWidth = 6
+            ..strokeCap = StrokeCap.round,
+        );
+        canvas.drawOval(
+          Rect.fromCenter(center: micHead, width: 28, height: 34),
+          glowPaint,
+        );
+        canvas.drawOval(
+          Rect.fromCenter(center: micHead, width: 28, height: 34),
+          fillPaint,
+        );
+
+        // Tangan Kanan Memegang Mikrofon, Tangan Kiri Melambai ke Penonton
+        _drawPalmWithFingers(
+          canvas,
+          micHead.translate(18, 12),
+          fillPaint,
+          glowPaint,
+          fingerAngles: [-1.2, -1.5],
+          fingerLengths: [18, 18],
+        );
+        _drawPalmWithFingers(
+          canvas,
+          Offset(
+              size.width * 0.14, size.height * 0.52 + (beatValue - 0.5) * 24),
+          fillPaint,
+          glowPaint,
+          fingerAngles: [-0.4, -0.1, 0.2, 0.45],
+          fingerLengths: [22, 26, 25, 20],
+          rotation: (handAnimValue - 0.5) * 0.5,
+        );
+        break;
+
+      case MusicianMode.none:
+        break;
+    }
   }
 
   void _drawEyebrows(
@@ -2250,68 +2838,68 @@ class EmoRobotFaceAndHandsPainter extends CustomPainter {
       ..strokeWidth = 7.5
       ..strokeCap = StrokeCap.round;
 
-    double leftOuterY = -56;
-    double leftInnerY = -56;
-    double rightInnerY = -56;
-    double rightOuterY = -56;
+    double leftOuterY = -52;
+    double leftInnerY = -52;
+    double rightInnerY = -52;
+    double rightOuterY = -52;
 
     switch (emotion) {
       case XiaoZhiEmotion.angry:
-        leftOuterY = -64;
-        leftInnerY = -42;
-        rightInnerY = -42;
-        rightOuterY = -64;
+        leftOuterY = -60;
+        leftInnerY = -38;
+        rightInnerY = -38;
+        rightOuterY = -60;
         break;
       case XiaoZhiEmotion.confident:
       case XiaoZhiEmotion.cool:
-        leftOuterY = -58;
-        leftInnerY = -46;
-        rightInnerY = -54;
-        rightOuterY = -68;
+        leftOuterY = -54;
+        leftInnerY = -44;
+        rightInnerY = -50;
+        rightOuterY = -64;
         break;
       case XiaoZhiEmotion.sad:
       case XiaoZhiEmotion.crying:
       case XiaoZhiEmotion.embarrassed:
-        leftOuterY = -42;
-        leftInnerY = -62;
-        rightInnerY = -62;
-        rightOuterY = -42;
+        leftOuterY = -40;
+        leftInnerY = -58;
+        rightInnerY = -58;
+        rightOuterY = -40;
         break;
       case XiaoZhiEmotion.thinking:
       case XiaoZhiEmotion.confused:
-        leftOuterY = -50;
-        leftInnerY = -50;
-        rightInnerY = -70;
-        rightOuterY = -66;
+        leftOuterY = -48;
+        leftInnerY = -48;
+        rightInnerY = -66;
+        rightOuterY = -62;
         break;
       case XiaoZhiEmotion.surprised:
       case XiaoZhiEmotion.shocked:
-        leftOuterY = -70;
-        leftInnerY = -74;
-        rightInnerY = -74;
-        rightOuterY = -70;
+        leftOuterY = -66;
+        leftInnerY = -70;
+        rightInnerY = -70;
+        rightOuterY = -66;
         break;
       case XiaoZhiEmotion.happy:
       case XiaoZhiEmotion.laughing:
       case XiaoZhiEmotion.loving:
       case XiaoZhiEmotion.winking:
-        leftOuterY = -60;
-        leftInnerY = -64;
-        rightInnerY = -64;
-        rightOuterY = -60;
+        leftOuterY = -56;
+        leftInnerY = -60;
+        rightInnerY = -60;
+        rightOuterY = -56;
         break;
       case XiaoZhiEmotion.sleepy:
       case XiaoZhiEmotion.dead:
-        leftOuterY = -44;
-        leftInnerY = -48;
-        rightInnerY = -48;
-        rightOuterY = -44;
+        leftOuterY = -42;
+        leftInnerY = -46;
+        rightInnerY = -46;
+        rightOuterY = -42;
         break;
       default:
-        leftOuterY = -56;
-        leftInnerY = -56;
-        rightInnerY = -56;
-        rightOuterY = -56;
+        leftOuterY = -52;
+        leftInnerY = -52;
+        rightInnerY = -52;
+        rightOuterY = -52;
         break;
     }
 
@@ -2357,7 +2945,8 @@ class EmoRobotFaceAndHandsPainter extends CustomPainter {
     if ((emotion == XiaoZhiEmotion.winking ||
             emotion == XiaoZhiEmotion.kissy ||
             emotion == XiaoZhiEmotion.silly) &&
-        !isLeft) {
+        !isLeft &&
+        !isCrossEyed) {
       canvas.drawArc(
         Rect.fromCenter(center: center, width: w, height: 25),
         pi,
@@ -2374,7 +2963,7 @@ class EmoRobotFaceAndHandsPainter extends CustomPainter {
         emotion == XiaoZhiEmotion.relaxed ||
         emotion == XiaoZhiEmotion.delicious) {
       canvas.drawArc(
-        Rect.fromCenter(center: center.translate(0, 10), width: w, height: 52),
+        Rect.fromCenter(center: center.translate(0, 10), width: w, height: 50),
         pi,
         pi,
         false,
@@ -2400,11 +2989,13 @@ class EmoRobotFaceAndHandsPainter extends CustomPainter {
       h *= 0.22;
     } else if (emotion == XiaoZhiEmotion.surprised ||
         emotion == XiaoZhiEmotion.shocked) {
-      w = 72;
-      h = 72 * (1.0 - blinkValue * 0.9);
+      w = 70;
+      h = 70 * (1.0 - blinkValue * 0.9);
     } else if (emotion == XiaoZhiEmotion.confused && isLeft) {
       h *= 0.62;
-    } else if (emotion == XiaoZhiEmotion.cool) {
+    } else if (emotion == XiaoZhiEmotion.cool ||
+        musicianMode == MusicianMode.dj ||
+        musicianMode == MusicianMode.guitar) {
       h *= 0.66;
     }
 
@@ -2457,7 +3048,7 @@ class EmoRobotFaceAndHandsPainter extends CustomPainter {
   }
 
   void _drawMouth(Canvas canvas, Size size, Offset shift) {
-    final mouthCenter = Offset(size.width * 0.5, size.height * 0.78) + shift;
+    final mouthCenter = Offset(size.width * 0.5, size.height * 0.66) + shift;
     final strokePaint = Paint()
       ..color = faceColor
       ..style = PaintingStyle.stroke
@@ -2484,7 +3075,6 @@ class EmoRobotFaceAndHandsPainter extends CustomPainter {
 
     switch (emotion) {
       case XiaoZhiEmotion.dead:
-        // Mulut miring + lidah menjulur keluar saat mati
         canvas.drawLine(
           mouthCenter.translate(-26, 2),
           mouthCenter.translate(26, -2),
@@ -2611,7 +3201,6 @@ class EmoRobotFaceAndHandsPainter extends CustomPainter {
     }
   }
 
-  // Menggambar Tangan & Jari Robot Neon Ekspresif
   void _drawExpressiveHands(
       Canvas canvas, Size size, Paint fillPaint, Paint glowPaint) {
     if (handGesture == HandGesture.none) return;
@@ -2619,8 +3208,22 @@ class EmoRobotFaceAndHandsPainter extends CustomPainter {
     final double bounce = (handAnimValue - 0.5) * 16;
 
     switch (handGesture) {
+      case HandGesture.highFive:
+        // Telapak Tangan Besar di Depan untuk TOS / High-Five!
+        final palm = Offset(size.width * 0.5, size.height * 0.56);
+        _drawPalmWithFingers(
+          canvas,
+          palm,
+          fillPaint,
+          glowPaint,
+          fingerAngles: [-0.65, -0.32, 0.0, 0.32, 0.65],
+          fingerLengths: [28, 36, 40, 36, 28],
+          palmScale: 1.45,
+        );
+        break;
+
       case HandGesture.wave:
-        final palm = Offset(size.width * 0.88, size.height * 0.52 + bounce);
+        final palm = Offset(size.width * 0.88, size.height * 0.48 + bounce);
         _drawPalmWithFingers(
           canvas,
           palm,
@@ -2633,8 +3236,8 @@ class EmoRobotFaceAndHandsPainter extends CustomPainter {
         break;
 
       case HandGesture.peace:
-        // Gestur 2 Jari Peace (V-Sign)
-        final palm = Offset(size.width * 0.88, size.height * 0.55 + bounce * 0.5);
+        final palm =
+            Offset(size.width * 0.88, size.height * 0.50 + bounce * 0.5);
         _drawPalmWithFingers(
           canvas,
           palm,
@@ -2647,8 +3250,8 @@ class EmoRobotFaceAndHandsPainter extends CustomPainter {
         break;
 
       case HandGesture.thumbsUp:
-        // Gestur Jempol Keren
-        final palm = Offset(size.width * 0.86, size.height * 0.58 + bounce * 0.4);
+        final palm =
+            Offset(size.width * 0.86, size.height * 0.52 + bounce * 0.4);
         _drawPalmWithFingers(
           canvas,
           palm,
@@ -2660,9 +3263,8 @@ class EmoRobotFaceAndHandsPainter extends CustomPainter {
         break;
 
       case HandGesture.thinkingChin:
-        // Tangan di bawah dagu mengetuk jari telunjuk
         final palm = Offset(
-            size.width * 0.62, size.height * 0.90 + (handAnimValue * 5));
+            size.width * 0.62, size.height * 0.80 + (handAnimValue * 5));
         _drawPalmWithFingers(
           canvas,
           palm,
@@ -2674,12 +3276,9 @@ class EmoRobotFaceAndHandsPainter extends CustomPainter {
         break;
 
       case HandGesture.angryFists:
-        // Kedua kepalan tinju bergetar
         final shake = sin(handAnimValue * pi * 4) * 6;
-        final leftFist =
-            Offset(size.width * 0.12 + shake, size.height * 0.62);
-        final rightFist =
-            Offset(size.width * 0.88 - shake, size.height * 0.62);
+        final leftFist = Offset(size.width * 0.12 + shake, size.height * 0.56);
+        final rightFist = Offset(size.width * 0.88 - shake, size.height * 0.56);
         _drawPalmWithFingers(canvas, leftFist, fillPaint, glowPaint,
             fingerAngles: [], fingerLengths: []);
         _drawPalmWithFingers(canvas, rightFist, fillPaint, glowPaint,
@@ -2688,9 +3287,9 @@ class EmoRobotFaceAndHandsPainter extends CustomPainter {
 
       case HandGesture.coverCheeks:
         final leftPalm =
-            Offset(size.width * 0.15, size.height * 0.60 + bounce * 0.3);
+            Offset(size.width * 0.15, size.height * 0.54 + bounce * 0.3);
         final rightPalm =
-            Offset(size.width * 0.85, size.height * 0.60 + bounce * 0.3);
+            Offset(size.width * 0.85, size.height * 0.54 + bounce * 0.3);
         _drawPalmWithFingers(
           canvas,
           leftPalm,
@@ -2710,11 +3309,10 @@ class EmoRobotFaceAndHandsPainter extends CustomPainter {
         break;
 
       case HandGesture.handsUp:
-        // Kedua tangan angkat ke atas saat ditembak!
         final leftUp =
-            Offset(size.width * 0.12, size.height * 0.25 + bounce * 0.6);
+            Offset(size.width * 0.12, size.height * 0.22 + bounce * 0.6);
         final rightUp =
-            Offset(size.width * 0.88, size.height * 0.25 + bounce * 0.6);
+            Offset(size.width * 0.88, size.height * 0.22 + bounce * 0.6);
         _drawPalmWithFingers(
           canvas,
           leftUp,
@@ -2734,9 +3332,8 @@ class EmoRobotFaceAndHandsPainter extends CustomPainter {
         break;
 
       case HandGesture.deadDrop:
-        // Tangan terkulai lemas di bawah saat mati
-        final leftDead = Offset(size.width * 0.16, size.height * 0.86);
-        final rightDead = Offset(size.width * 0.84, size.height * 0.86);
+        final leftDead = Offset(size.width * 0.16, size.height * 0.78);
+        final rightDead = Offset(size.width * 0.84, size.height * 0.78);
         _drawPalmWithFingers(
           canvas,
           leftDead,
@@ -2768,12 +3365,13 @@ class EmoRobotFaceAndHandsPainter extends CustomPainter {
     required List<double> fingerAngles,
     required List<double> fingerLengths,
     double rotation = 0.0,
+    double palmScale = 1.0,
   }) {
     canvas.save();
     canvas.translate(palmCenter.dx, palmCenter.dy);
     canvas.rotate(rotation);
+    canvas.scale(palmScale);
 
-    // Telapak tangan bulat neon
     final palmRect = RRect.fromRectAndRadius(
       Rect.fromCenter(center: Offset.zero, width: 36, height: 32),
       const Radius.circular(14),
@@ -2781,7 +3379,6 @@ class EmoRobotFaceAndHandsPainter extends CustomPainter {
     canvas.drawRRect(palmRect, glowPaint);
     canvas.drawRRect(palmRect, fillPaint);
 
-    // Jari-jari artikulasi
     final fingerStroke = Paint()
       ..color = fillPaint.color
       ..style = PaintingStyle.stroke
@@ -2826,15 +3423,12 @@ class ScreenCrackPainter extends CustomPainter {
       ..strokeWidth = 2.2
       ..strokeCap = StrokeCap.round;
 
-    // Lubang titik tembakan di kaca
     canvas.drawCircle(origin, 10, glowPaint);
     canvas.drawCircle(origin, 6, Paint()..color = Colors.white);
 
-    // Cincin retakan melingkar
     canvas.drawCircle(origin, 28, crackPaint);
     canvas.drawCircle(origin, 58, crackPaint..strokeWidth = 1.4);
 
-    // Garis-garis retakan menyebar
     for (final branch in branches) {
       if (branch.length < 2) continue;
       final path = Path()..moveTo(branch.first.dx, branch.first.dy);
