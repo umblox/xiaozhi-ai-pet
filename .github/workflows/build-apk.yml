@@ -42,13 +42,22 @@ jobs:
       - name: Fetch Dependencies
         run: flutter pub get
 
-      - name: Patch Android SDK 35, Native GPS, NDK & Plugin Pub-Cache
+      - name: Patch Android SDK 35, GPS, Native Bridge & Pub-Cache
         run: |
           python3 - << 'EOF'
           import os
           import re
 
-          # 1. Suntikkan Permission GPS, Kamera, Mic ke AndroidManifest.xml
+          # 1. Pastikan kompatibilitas parameter speech_to_text 7.4.0 di lib/main.dart
+          main_dart = "lib/main.dart"
+          if os.path.exists(main_dart):
+              with open(main_dart, "r") as f:
+                  code = f.read()
+              code = code.replace("partialResults: true,", "").replace("cancelOnError: false,", "")
+              with open(main_dart, "w") as f:
+                  f.write(code)
+
+          # 2. Suntikkan Permission Lengkap (Termasuk GPS Fine/Coarse & Kamera) ke AndroidManifest.xml
           manifest_path = "android/app/src/main/AndroidManifest.xml"
           with open(manifest_path, "r") as f:
               content = f.read()
@@ -61,124 +70,138 @@ jobs:
               <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS"/>
               <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>
               <uses-permission android:name="android.permission.WAKE_LOCK"/>
+              <uses-feature android:name="android.hardware.camera" android:required="false"/>
+              <uses-feature android:name="android.hardware.camera.front" android:required="false"/>
           """
-          if "android.permission.INTERNET" not in content:
+          if "android.permission.ACCESS_FINE_LOCATION" not in content:
               content = content.replace("<application", permissions + "\n    <application", 1)
           content = content.replace('android:label="xiaozhi_pet"', 'android:label="XiaoZhi AI Pet"')
           with open(manifest_path, "w") as f:
               f.write(content)
 
-          # 2. Suntikkan Native Hardware GPS & Audio Volume ke MainActivity.kt
-          for root, dirs, files in os.walk("android/app/src/main/kotlin"):
-              if "MainActivity.kt" in files:
-                  kt_path = os.path.join(root, "MainActivity.kt")
-                  with open(kt_path, "r") as f:
-                      first_line = f.readline().strip()
-                  kt_code = f"""{first_line}
+          # 3. Suntikkan Jembatan Native GPS, Volume & Keep-Screen-On ke MainActivity.kt
+          kt_path = "android/app/src/main/kotlin/id/xiaozhi/aipet/xiaozhi_pet/MainActivity.kt"
+          if os.path.exists(kt_path):
+              kt_code = """package id.xiaozhi.aipet.xiaozhi_pet
 
-          import android.Manifest
+          import android.annotation.SuppressLint
           import android.content.Context
-          import android.content.pm.PackageManager
           import android.location.Location
           import android.location.LocationListener
           import android.location.LocationManager
           import android.media.AudioManager
-          import android.os.Build
           import android.os.Bundle
           import android.os.Handler
           import android.os.Looper
+          import android.view.WindowManager
           import io.flutter.embedding.android.FlutterActivity
           import io.flutter.embedding.engine.FlutterEngine
           import io.flutter.plugin.common.MethodChannel
 
-          class MainActivity: FlutterActivity() {{
-              private val CHANNEL = "id.xiaozhi.aipet/native"
+          class MainActivity: FlutterActivity() {
+              private val CHANNEL = "id.xiaozhi.aipet/device"
 
-              override fun configureFlutterEngine(flutterEngine: FlutterEngine) {{
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+              }
+
+              @SuppressLint("MissingPermission")
+              override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
                   super.configureFlutterEngine(flutterEngine)
-                  MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL).setMethodCallHandler {{ call, result ->
-                      when (call.method) {{
-                          "getGps" -> getGpsCoordinates(result)
-                          "setVolume" -> {{
-                              val level = call.argument<Int>("level") ?: 80
-                              val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
-                              val max = am.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
-                              val target = (level.coerceIn(0, 100) * max) / 100
-                              am.setStreamVolume(AudioManager.STREAM_MUSIC, target, 0)
-                              result.success(level)
-                          }}
-                          "getVolume" -> {{
+                  MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL).setMethodCallHandler { call, result ->
+                      when (call.method) {
+                          "getGpsLocation" -> {
+                              try {
+                                  val lm = getSystemService(Context.LOCATION_SERVICE) as LocationManager
+                                  val providers = listOf(
+                                      LocationManager.GPS_PROVIDER,
+                                      LocationManager.NETWORK_PROVIDER,
+                                      LocationManager.PASSIVE_PROVIDER
+                                  )
+                                  var bestLocation: Location? = null
+                                  for (p in providers) {
+                                      if (lm.isProviderEnabled(p)) {
+                                          val loc = lm.getLastKnownLocation(p)
+                                          if (loc != null) {
+                                              if (bestLocation == null || loc.accuracy < bestLocation!!.accuracy) {
+                                                  bestLocation = loc
+                                              }
+                                          }
+                                      }
+                                  }
+                                  if (bestLocation != null) {
+                                      result.success(mapOf(
+                                          "lat" to bestLocation!!.latitude,
+                                          "lon" to bestLocation!!.longitude
+                                      ))
+                                  } else {
+                                      val activeProvider = when {
+                                          lm.isProviderEnabled(LocationManager.NETWORK_PROVIDER) -> LocationManager.NETWORK_PROVIDER
+                                          lm.isProviderEnabled(LocationManager.GPS_PROVIDER) -> LocationManager.GPS_PROVIDER
+                                          else -> null
+                                      }
+                                      if (activeProvider != null) {
+                                          var replied = false
+                                          val listener = object : LocationListener {
+                                              override fun onLocationChanged(loc: Location) {
+                                                  if (!replied) {
+                                                      replied = true
+                                                      lm.removeUpdates(this)
+                                                      result.success(mapOf("lat" to loc.latitude, "lon" to loc.longitude))
+                                                  }
+                                              }
+                                              override fun onProviderEnabled(provider: String) {}
+                                              override fun onProviderDisabled(provider: String) {}
+                                              @Deprecated("Deprecated in Java")
+                                              override fun onStatusChanged(provider: String?, status: Int, extras: Bundle?) {}
+                                          }
+                                          lm.requestLocationUpdates(activeProvider, 0L, 0f, listener, Looper.getMainLooper())
+                                          Handler(Looper.getMainLooper()).postDelayed({
+                                              if (!replied) {
+                                                  replied = true
+                                                  lm.removeUpdates(listener)
+                                                  result.success(null)
+                                              }
+                                          }, 4000)
+                                      } else {
+                                          result.success(null)
+                                      }
+                                  }
+                              } catch (e: Exception) {
+                                  result.success(null)
+                              }
+                          }
+                          "getVolume" -> {
                               val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
                               val max = am.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
                               val cur = am.getStreamVolume(AudioManager.STREAM_MUSIC)
                               val pct = if (max > 0) (cur * 100) / max else 80
                               result.success(pct)
-                          }}
+                          }
+                          "setVolume" -> {
+                              val level = call.argument<Int>("volume") ?: 80
+                              val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+                              val max = am.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
+                              val target = ((level.coerceIn(0, 100) * max) / 100.0).toInt()
+                              am.setStreamVolume(AudioManager.STREAM_MUSIC, target, 0)
+                              result.success(true)
+                          }
                           else -> result.notImplemented()
-                      }}
-                  }}
-              }}
-
-              private fun getGpsCoordinates(result: MethodChannel.Result) {{
-                  try {{
-                      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {{
-                          if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED &&
-                              checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION) != PackageManager.PERMISSION_GRANTED) {{
-                              requestPermissions(arrayOf(Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION), 101)
-                              result.error("PERM", "Permission requested", null)
-                              return
-                          }}
-                      }}
-                      val lm = getSystemService(Context.LOCATION_SERVICE) as LocationManager
-                      val providers = lm.getProviders(true)
-                      var bestLocation: Location? = null
-                      for (provider in providers) {{
-                          val l = lm.getLastKnownLocation(provider) ?: continue
-                          if (bestLocation == null || l.accuracy < bestLocation.accuracy) {{
-                              bestLocation = l
-                          }}
-                      }}
-                      if (bestLocation != null) {{
-                          result.success(mapOf("lat" to bestLocation.latitude, "lon" to bestLocation.longitude))
-                      }} else {{
-                          val provider = if (lm.isProviderEnabled(LocationManager.GPS_PROVIDER)) LocationManager.GPS_PROVIDER else LocationManager.NETWORK_PROVIDER
-                          var answered = false
-                          val listener = object : LocationListener {{
-                              override fun onLocationChanged(loc: Location) {{
-                                  if (!answered) {{
-                                      answered = true
-                                      lm.removeUpdates(this)
-                                      result.success(mapOf("lat" to loc.latitude, "lon" to loc.longitude))
-                                  }}
-                              }}
-                              override fun onStatusChanged(p: String?, s: Int, e: Bundle?) {{}}
-                              override fun onProviderEnabled(p: String) {{}}
-                              override fun onProviderDisabled(p: String) {{}}
-                          }}
-                          lm.requestLocationUpdates(provider, 0L, 0f, listener, Looper.getMainLooper())
-                          Handler(Looper.getMainLooper()).postDelayed({{
-                              if (!answered) {{
-                                  answered = true
-                                  lm.removeUpdates(listener)
-                                  result.error("TIMEOUT", "GPS timeout", null)
-                              }}
-                          }}, 4500)
-                      }}
-                  }} catch (e: Exception) {{
-                      result.error("ERR", e.message, null)
-                  }}
-              }}
-          }}
+                      }
+                  }
+              }
+          }
           """
-                  with open(kt_path, "w") as f:
-                      f.write(kt_code)
+              with open(kt_path, "w") as f:
+                  f.write("\n".join(line[10:] if line.startswith("          ") else line for line in kt_code.splitlines()))
 
-          # 3. Tambahkan toleransi JVM target di gradle.properties
+          # 4. Tambahkan toleransi JVM target di gradle.properties
           prop_path = "android/gradle.properties"
           with open(prop_path, "a") as f:
               f.write("\nkotlin.jvm.target.validation.mode=warning\n")
 
-          # 4. Set SDK 35, minSdk 23, dan NDK di android/app/build.gradle
+          # 5. Set SDK 35, minSdk 23, dan NDK di android/app/build.gradle
           gradle_path = "android/app/build.gradle"
           with open(gradle_path, "r") as f:
               g = f.read()
@@ -189,7 +212,7 @@ jobs:
           with open(gradle_path, "w") as f:
               f.write(g)
 
-          # 5. Tambal seluruh build.gradle & record_linux.dart di ~/.pub-cache
+          # 6. Tambal seluruh build.gradle & record_linux.dart di ~/.pub-cache
           pub_cache = os.path.expanduser("~/.pub-cache")
           for root, dirs, files in os.walk(pub_cache):
               if "record_linux.dart" in files:
@@ -197,17 +220,16 @@ jobs:
                   try:
                       with open(rl_path, "r") as f:
                           rl = f.read()
-                      if "noSuchMethod" not in rl:
-                          rl = rl.replace(
-                              "class RecordLinux extends RecordPlatform {",
-                              "class RecordLinux extends RecordPlatform {\n  @override\n  dynamic noSuchMethod(Invocation i) => super.noSuchMethod(i);"
-                          )
-                          rl = rl.replace(
-                              "Future<bool> hasPermission(String recorderId)",
-                              "Future<bool> hasPermission(String recorderId, {bool request = true})"
-                          )
-                          with open(rl_path, "w") as f:
-                              f.write(rl)
+                      rl = rl.replace(
+                          "class RecordLinux extends RecordPlatform {",
+                          "class RecordLinux extends RecordPlatform {\n  @override\n  dynamic noSuchMethod(Invocation i) => super.noSuchMethod(i);"
+                      )
+                      rl = rl.replace(
+                          "Future<bool> hasPermission(String recorderId)",
+                          "Future<bool> hasPermission(String recorderId, {bool request = true})"
+                      )
+                      with open(rl_path, "w") as f:
+                          f.write(rl)
                   except Exception:
                       pass
 
@@ -257,7 +279,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: latest-build
-          name: "XiaoZhi AI Pet - Full GPS, Selfie Vision & 21 Emotions"
-          body: "Download langsung file **xiaozhi-ai-pet.apk** di bawah ini."
+          name: "XiaoZhi AI Pet - Pure XiaoZhi Edition"
+          body: "Download langsung file **xiaozhi-ai-pet.apk** di bawah ini (100% Opus XiaoZhi Audio + Wake Word + GPS + MCP Camera Vision)."
           files: xiaozhi-ai-pet.apk
           prerelease: false
