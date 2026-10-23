@@ -16,18 +16,12 @@ import 'package:opus_flutter/opus_flutter.dart' as opus_flutter;
 import 'package:camera/camera.dart';
 import 'package:permission_handler/permission_handler.dart';
 
-List<CameraDescription> globalCameras = [];
-
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
 
   try {
     initOpus(await opus_flutter.load());
-  } catch (_) {}
-
-  try {
-    globalCameras = await availableCameras();
   } catch (_) {}
 
   runApp(const XiaoZhiPureApp());
@@ -50,19 +44,30 @@ class XiaoZhiPureApp extends StatelessWidget {
   }
 }
 
-enum PetEmotion {
-  normal,
+// 21 Emosi Resmi Bawaan XiaoZhi + Dizzy (Sensor Goyang)
+enum XiaoZhiEmotion {
+  neutral,
   happy,
-  love,
-  excited,
-  thinking,
-  surprised,
+  laughing,
+  funny,
   sad,
-  crying,
   angry,
+  crying,
+  loving,
+  embarrassed,
+  surprised,
+  shocked,
+  thinking,
+  winking,
+  cool,
+  relaxed,
+  delicious,
+  kissy,
+  confident,
   sleepy,
-  wink,
-  dizzy
+  silly,
+  confused,
+  dizzy,
 }
 
 enum SessionState { standbyWakeWord, listeningToUser, speakingTts }
@@ -92,9 +97,13 @@ class PetHomeScreen extends StatefulWidget {
 
 class _PetHomeScreenState extends State<PetHomeScreen>
     with TickerProviderStateMixin {
-  // Konfigurasi Minimalis (Hanya Wake Word & Warna Mata)
-  String wakePetName = "xiaozhi";
-  int themeColorIndex = 0;
+  static const MethodChannel _deviceChannel =
+      MethodChannel('id.xiaozhi.aipet/device');
+
+  // Pengaturan Wake Word & Tampilan
+  String wakePetName = "kimmi";
+  int themeColorIndex = 1;
+  bool useEmojiStyle = false; // false = Robot Neon, true = Emoji XiaoZhi
 
   // Identitas & Koneksi Protokol XiaoZhi
   String deviceMac = "";
@@ -109,6 +118,9 @@ class _PetHomeScreenState extends State<PetHomeScreen>
 
   // Status Sesi & Audio Opus Native
   SessionState sessionState = SessionState.standbyWakeWord;
+  bool isVoiceAudioActive = false; // True hanya saat paket suara Opus berbunyi
+  Timer? _voiceDecayTimer;
+
   final stt.SpeechToText _wakeStt = stt.SpeechToText();
   final AudioRecorder _micRecorder = AudioRecorder();
   StreamSubscription<Uint8List>? _micStreamSub;
@@ -117,13 +129,20 @@ class _PetHomeScreenState extends State<PetHomeScreen>
   final List<int> _pcmMicBuffer = [];
   int _serverSampleRate = 24000;
 
-  // Kamera MCP Vision
+  // Kamera MCP Vision (Mendukung Pindah Selfie / Belakang)
+  List<CameraDescription> _cameras = [];
   CameraController? _cameraController;
   int _selectedCameraIdx = 0;
   bool showCameraPreview = false;
+  bool _isCameraBusy = false;
 
-  // Data Waktu & Cuaca HUD
+  // Data GPS Asli & Cuaca Lokal
+  double? gpsLat;
+  double? gpsLon;
+  String locationName = "Mencari GPS...";
   String weatherSummary = "Memuat cuaca...";
+  double currentTempC = 28.0;
+  String weatherCondition = "Cerah";
   String timeString = "";
   String dateString = "";
   bool isLandscape = false;
@@ -136,7 +155,7 @@ class _PetHomeScreenState extends State<PetHomeScreen>
     Colors.purpleAccent,
   ];
 
-  PetEmotion currentEmotion = PetEmotion.normal;
+  XiaoZhiEmotion currentEmotion = XiaoZhiEmotion.neutral;
   String statusSubtitle = "Menginisialisasi koneksi XiaoZhi...";
 
   Offset gazeOffset = Offset.zero;
@@ -158,7 +177,7 @@ class _PetHomeScreenState extends State<PetHomeScreen>
     super.initState();
     _blinkController = AnimationController(
       vsync: this,
-      duration: const Duration(milliseconds: 150),
+      duration: const Duration(milliseconds: 140),
     );
     _floatController = AnimationController(
       vsync: this,
@@ -166,7 +185,7 @@ class _PetHomeScreenState extends State<PetHomeScreen>
     )..repeat(reverse: true);
     _talkController = AnimationController(
       vsync: this,
-      duration: const Duration(milliseconds: 160),
+      duration: const Duration(milliseconds: 140),
     )..repeat(reverse: true);
 
     _updateClock();
@@ -179,7 +198,6 @@ class _PetHomeScreenState extends State<PetHomeScreen>
     _particleTimer = Timer.periodic(
         const Duration(milliseconds: 50), (_) => _updateParticles());
 
-    // Penjaga agar Wake Word selalu aktif saat mode Standby
     _wakeRestartTimer = Timer.periodic(const Duration(seconds: 4), (_) {
       if (sessionState == SessionState.standbyWakeWord &&
           !_wakeStt.isListening) {
@@ -194,12 +212,14 @@ class _PetHomeScreenState extends State<PetHomeScreen>
     await [
       Permission.microphone,
       Permission.camera,
+      Permission.location,
+      Permission.locationWhenInUse,
     ].request();
 
     await _loadIdentityAndSettings();
     await _initOpusAndPcmEngine();
-    await _initCameraController();
-    _fetchWeatherHud();
+    await _initCamerasAfterPermission(preferFront: true);
+    _fetchHardwareGpsAndWeather();
     await _syncXiaoZhiOtaAndConnect();
     _startWakeWordListener();
   }
@@ -225,8 +245,9 @@ class _PetHomeScreenState extends State<PetHomeScreen>
     setState(() {
       deviceMac = savedMac!;
       clientId = savedClient!;
-      wakePetName = prefs.getString('wakePetName') ?? "xiaozhi";
-      themeColorIndex = prefs.getInt('themeColorIndex') ?? 0;
+      wakePetName = prefs.getString('wakePetName') ?? "kimmi";
+      themeColorIndex = prefs.getInt('themeColorIndex') ?? 1;
+      useEmojiStyle = prefs.getBool('useEmojiStyle') ?? false;
     });
   }
 
@@ -249,30 +270,171 @@ class _PetHomeScreenState extends State<PetHomeScreen>
     } catch (_) {}
   }
 
-  Future<void> _initCameraController() async {
-    if (globalCameras.isEmpty) return;
+  // =======================================================================
+  // 1. KAMERA VISION (DEFAULT KAMERA SELFIE & BISA PINDAH DEPAN/BELAKANG)
+  // =======================================================================
+  Future<void> _initCamerasAfterPermission({bool preferFront = true}) async {
     try {
-      _cameraController?.dispose();
-      _cameraController = CameraController(
-        globalCameras[_selectedCameraIdx],
-        ResolutionPreset.medium,
+      _cameras = await availableCameras();
+      if (_cameras.isEmpty) return;
+
+      if (preferFront) {
+        final frontIdx = _cameras.indexWhere(
+            (c) => c.lensDirection == CameraLensDirection.front);
+        _selectedCameraIdx = frontIdx != -1 ? frontIdx : 0;
+      } else {
+        final backIdx = _cameras
+            .indexWhere((c) => c.lensDirection == CameraLensDirection.back);
+        _selectedCameraIdx = backIdx != -1 ? backIdx : 0;
+      }
+
+      await _startSelectedCamera();
+    } catch (_) {}
+  }
+
+  Future<void> _startSelectedCamera() async {
+    if (_cameras.isEmpty) return;
+    try {
+      final prev = _cameraController;
+      _cameraController = null;
+      await prev?.dispose();
+
+      final controller = CameraController(
+        _cameras[_selectedCameraIdx],
+        ResolutionPreset.low, // Ukuran ringan agar upload Vision cepat & anti gagal
         enableAudio: false,
+        imageFormatGroup: ImageFormatGroup.jpeg,
       );
-      await _cameraController!.initialize();
+      await controller.initialize();
+      try {
+        await controller.setFlashMode(FlashMode.off);
+      } catch (_) {}
+
+      _cameraController = controller;
       if (mounted) setState(() {});
     } catch (_) {}
   }
 
-  Future<void> _switchCameraLens() async {
-    if (globalCameras.length < 2) return;
-    _selectedCameraIdx = (_selectedCameraIdx + 1) % globalCameras.length;
-    await _initCameraController();
+  Future<String> _switchCameraLens({String? targetDirection}) async {
+    if (_cameras.isEmpty) {
+      _cameras = await availableCameras();
+    }
+    if (_cameras.isEmpty) return "unavailable";
+
+    if (targetDirection == "front" || targetDirection == "selfie") {
+      final idx = _cameras
+          .indexWhere((c) => c.lensDirection == CameraLensDirection.front);
+      if (idx != -1) _selectedCameraIdx = idx;
+    } else if (targetDirection == "back" || targetDirection == "rear") {
+      final idx = _cameras
+          .indexWhere((c) => c.lensDirection == CameraLensDirection.back);
+      if (idx != -1) _selectedCameraIdx = idx;
+    } else {
+      _selectedCameraIdx = (_selectedCameraIdx + 1) % _cameras.length;
+    }
+
+    await _startSelectedCamera();
+    final lens = _cameras[_selectedCameraIdx].lensDirection ==
+            CameraLensDirection.front
+        ? "front"
+        : "back";
+    return lens;
+  }
+
+  String get _currentLensName {
+    if (_cameras.isEmpty || _selectedCameraIdx >= _cameras.length) {
+      return "front";
+    }
+    return _cameras[_selectedCameraIdx].lensDirection ==
+            CameraLensDirection.front
+        ? "front"
+        : "back";
   }
 
   // =======================================================================
-  // 1. PROTOKOL OTA & WEBSOCKET RESMI XIAOZHI (MURNI TANPA AI LOKAL)
+  // 2. LOKASI GPS ASLI HP + CUACA REAL-TIME
   // =======================================================================
-  Future<void> _syncXiaoZhiOtaAndConnect({bool showDialogIfPaired = false}) async {
+  Future<void> _fetchHardwareGpsAndWeather() async {
+    try {
+      // Ambil titik koordinat dari Hardware GPS Android via Native Channel
+      final dynamic gpsMap =
+          await _deviceChannel.invokeMethod('getGpsLocation');
+      if (gpsMap != null && gpsMap is Map) {
+        gpsLat = (gpsMap['lat'] as num?)?.toDouble();
+        gpsLon = (gpsMap['lon'] as num?)?.toDouble();
+      }
+
+      // Jika GPS di dalam ruangan belum mengunci, gunakan fallback geo
+      if (gpsLat == null || gpsLon == null) {
+        final ipRes = await http
+            .get(Uri.parse("https://api.bigdatacloud.net/data/reverse-geocode-client?localityLanguage=id"))
+            .timeout(const Duration(seconds: 6));
+        if (ipRes.statusCode == 200) {
+          final d = jsonDecode(ipRes.body);
+          gpsLat = (d['latitude'] as num?)?.toDouble();
+          gpsLon = (d['longitude'] as num?)?.toDouble();
+        }
+      }
+
+      if (gpsLat != null && gpsLon != null) {
+        // Reverse Geocoding akurat dari koordinat GPS ke Nama Kecamatan/Kota
+        final revUrl =
+            "https://api.bigdatacloud.net/data/reverse-geocode-client?latitude=$gpsLat&longitude=$gpsLon&localityLanguage=id";
+        final revRes = await http
+            .get(Uri.parse(revUrl))
+            .timeout(const Duration(seconds: 6));
+        if (revRes.statusCode == 200) {
+          final rev = jsonDecode(utf8.decode(revRes.bodyBytes));
+          final locality = rev['locality']?.toString() ?? "";
+          final city = rev['city']?.toString() ??
+              rev['principalSubdivision']?.toString() ??
+              "";
+          if (locality.isNotEmpty && city.isNotEmpty && locality != city) {
+            locationName = "$locality, $city";
+          } else if (locality.isNotEmpty) {
+            locationName = locality;
+          } else if (city.isNotEmpty) {
+            locationName = city;
+          }
+        }
+
+        // Ambil cuaca sesuai koordinat GPS
+        final wRes = await http
+            .get(Uri.parse(
+                "https://api.open-meteo.com/v1/forecast?latitude=$gpsLat&longitude=$gpsLon&current_weather=true"))
+            .timeout(const Duration(seconds: 6));
+        if (wRes.statusCode == 200) {
+          final w = jsonDecode(wRes.body)['current_weather'];
+          currentTempC = (w['temperature'] as num?)?.toDouble() ?? 28.0;
+          final wCode = (w['weathercode'] as num?)?.toInt() ?? 0;
+          weatherCondition = _decodeWeatherCode(wCode);
+          if (mounted) {
+            setState(() {
+              weatherSummary = "$currentTempC°C • $locationName";
+            });
+          }
+        }
+      }
+    } catch (_) {
+      if (mounted) setState(() => weatherSummary = "GPS Aktif • Online");
+    }
+  }
+
+  String _decodeWeatherCode(int code) {
+    if (code == 0) return "Cerah";
+    if (code <= 3) return "Berawan";
+    if (code <= 48) return "Berkabut";
+    if (code <= 67) return "Hujan Ringan";
+    if (code <= 82) return "Hujan Deras";
+    if (code >= 95) return "Badai Petir";
+    return "Cerah Berawan";
+  }
+
+  // =======================================================================
+  // 3. PROTOKOL OTA & WEBSOCKET XIAOZHI
+  // =======================================================================
+  Future<void> _syncXiaoZhiOtaAndConnect(
+      {bool showDialogIfPaired = false}) async {
     try {
       final response = await http
           .post(
@@ -300,7 +462,7 @@ class _PetHomeScreenState extends State<PetHomeScreen>
                 "type": "bread-compact-wifi",
                 "name": "bread-compact-wifi",
                 "ssid": "Android-AI-Pet",
-                "rssi": -40,
+                "rssi": -38,
                 "channel": 1,
                 "ip": "192.168.1.100",
                 "mac": deviceMac
@@ -320,7 +482,7 @@ class _PetHomeScreenState extends State<PetHomeScreen>
         if (data['activation'] != null && data['activation']['code'] != null) {
           final code = data['activation']['code'].toString();
           setState(() {
-            currentEmotion = PetEmotion.excited;
+            currentEmotion = XiaoZhiEmotion.surprised;
             statusSubtitle =
                 "Belum di-pairing! Masukkan kode $code di web xiaozhi.me";
           });
@@ -331,7 +493,7 @@ class _PetHomeScreenState extends State<PetHomeScreen>
         if (showDialogIfPaired && mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
             const SnackBar(
-                content: Text("Perangkat sudah terdaftar di akun XiaoZhi!")),
+                content: Text("Perangkat sudah terhubung ke akun XiaoZhi!")),
           );
         }
       }
@@ -362,7 +524,6 @@ class _PetHomeScreenState extends State<PetHomeScreen>
         });
       }
 
-      // Paket Hello + Dukungan MCP (Kamera Vision)
       socket.add(jsonEncode({
         "type": "hello",
         "version": 1,
@@ -421,11 +582,11 @@ class _PetHomeScreenState extends State<PetHomeScreen>
         if (text.isNotEmpty && mounted) {
           setState(() {
             statusSubtitle = "\"$text\"";
-            currentEmotion = PetEmotion.thinking;
+            currentEmotion = XiaoZhiEmotion.thinking;
           });
         }
       } else if (type == 'llm') {
-        final emo = data['emotion']?.toString() ?? "normal";
+        final emo = data['emotion']?.toString() ?? "neutral";
         if (mounted) {
           setState(() => currentEmotion = _mapXiaoZhiEmotion(emo));
         }
@@ -440,11 +601,22 @@ class _PetHomeScreenState extends State<PetHomeScreen>
           }
         } else if (state == 'sentence_start' && text.isNotEmpty) {
           if (mounted) {
-            setState(() => statusSubtitle = text);
+            // Jika teks diawali '%' (contoh: % self.camera.take_photo...), tampilkan rapi
+            if (text.trim().startsWith('%')) {
+              setState(() {
+                statusSubtitle = "⚙️ Menjalankan perintah: ${text.replaceFirst('%', '').trim()}";
+                isVoiceAudioActive = false;
+              });
+            } else {
+              setState(() => statusSubtitle = text);
+            }
           }
         } else if (state == 'stop') {
-          // Begitu XiaoZhi selesai bicara, otomatis dengarkan balasan user (Auto-Conversation)
-          Future.delayed(const Duration(milliseconds: 350), () {
+          _voiceDecayTimer?.cancel();
+          if (mounted) {
+            setState(() => isVoiceAudioActive = false);
+          }
+          Future.delayed(const Duration(milliseconds: 400), () {
             if (mounted && isXiaoZhiConnected) {
               _beginActiveOpusListening();
             }
@@ -456,19 +628,27 @@ class _PetHomeScreenState extends State<PetHomeScreen>
     } catch (_) {}
   }
 
-  // Decode Paket Audio Opus Biner dari Server XiaoZhi -> Speaker HP
+  // Decode Paket Audio Opus Biner -> Speaker HP + Aktifkan Animasi Mulut Mulus
   void _handleServerOpusBinary(Uint8List opusPacket) {
     if (_opusDecoder == null || opusPacket.isEmpty) return;
     try {
       final Int16List pcm16 = _opusDecoder!.decode(input: opusPacket);
       if (pcm16.isNotEmpty) {
         FlutterPcmSound.feed(PcmArrayInt16.fromList(pcm16.toList()));
+
+        if (!isVoiceAudioActive && mounted) {
+          setState(() => isVoiceAudioActive = true);
+        }
+        _voiceDecayTimer?.cancel();
+        _voiceDecayTimer = Timer(const Duration(milliseconds: 280), () {
+          if (mounted) setState(() => isVoiceAudioActive = false);
+        });
       }
     } catch (_) {}
   }
 
   // =======================================================================
-  // 2. PROTOKOL MCP VISION (KAMERA XIAOZHI)
+  // 4. PROTOKOL MCP LENGKAP (VISION, SWITCH CAMERA, GPS, WEATHER, VOLUME)
   // =======================================================================
   Future<void> _handleMcpPayload(dynamic payload) async {
     if (payload == null) return;
@@ -484,24 +664,73 @@ class _PetHomeScreenState extends State<PetHomeScreen>
       _sendMcpReply(id, {
         "protocolVersion": "2024-11-05",
         "capabilities": {"tools": {}},
-        "serverInfo": {"name": "XiaoZhi-Android-Pet", "version": "2.0.0"}
+        "serverInfo": {"name": "XiaoZhi-Android-Pet", "version": "2.1.0"}
       });
     } else if (method == 'tools/list') {
       _sendMcpReply(id, {
         "tools": [
           {
+            "name": "self.get_device_status",
+            "description":
+                "Provides real-time device status including GPS location, city/district name, local weather, audio speaker volume, and active camera direction (front/back).",
+            "inputSchema": {"type": "object", "properties": {}}
+          },
+          {
+            "name": "self.location.get_current_location",
+            "description":
+                "Get the user's exact hardware GPS coordinates, subdistrict/city address, and local weather condition.",
+            "inputSchema": {"type": "object", "properties": {}}
+          },
+          {
             "name": "self.camera.take_photo",
             "description":
-                "Take a photo using the Android camera to see what is in front of the pet robot.",
+                "Take a photo with the camera to see the user's face (front selfie camera) or surroundings (back camera) and answer questions about it.",
             "inputSchema": {
               "type": "object",
               "properties": {
                 "question": {
                   "type": "string",
-                  "description": "Question about what to look for in the photo"
+                  "description": "The question or prompt about the photo."
+                },
+                "camera": {
+                  "type": "string",
+                  "enum": ["front", "back"],
+                  "description":
+                      "Optional: 'front' for selfie/seeing the user, 'back' for rear environment camera."
                 }
               },
               "required": ["question"]
+            }
+          },
+          {
+            "name": "self.camera.switch_camera",
+            "description":
+                "Switch between the front (selfie) camera and the back (rear) camera.",
+            "inputSchema": {
+              "type": "object",
+              "properties": {
+                "camera": {
+                  "type": "string",
+                  "enum": ["front", "back"],
+                  "description": "Target camera direction: 'front' or 'back'."
+                }
+              }
+            }
+          },
+          {
+            "name": "self.audio_speaker.set_volume",
+            "description": "Set the audio speaker volume level (0 to 100).",
+            "inputSchema": {
+              "type": "object",
+              "properties": {
+                "volume": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 100,
+                  "description": "Volume level from 0 to 100"
+                }
+              },
+              "required": ["volume"]
             }
           }
         ]
@@ -510,13 +739,76 @@ class _PetHomeScreenState extends State<PetHomeScreen>
       final toolName = payload['params']?['name']?.toString() ?? "";
       final args = payload['params']?['arguments'] ?? {};
 
-      if (toolName == 'self.camera.take_photo') {
+      if (toolName == 'self.get_device_status' ||
+          toolName == 'self.location.get_current_location') {
+        await _fetchHardwareGpsAndWeather();
+        int vol = 80;
+        try {
+          vol = (await _deviceChannel.invokeMethod('getVolume')) as int? ?? 80;
+        } catch (_) {}
+
+        final statusJson = jsonEncode({
+          "audio_speaker": {"volume": vol},
+          "camera": {
+            "active_lens": _currentLensName,
+            "preview_visible": showCameraPreview
+          },
+          "location": {
+            "latitude": gpsLat,
+            "longitude": gpsLon,
+            "address": locationName,
+          },
+          "local_weather": {
+            "temperature_celsius": currentTempC,
+            "condition": weatherCondition,
+            "summary": weatherSummary
+          },
+          "local_time": "$timeString ($dateString)"
+        });
+
+        _sendMcpReply(id, {
+          "content": [
+            {"type": "text", "text": statusJson}
+          ],
+          "isError": false
+        });
+      } else if (toolName == 'self.camera.switch_camera') {
+        final target = args['camera']?.toString();
+        final activeLens = await _switchCameraLens(targetDirection: target);
+        setState(() => showCameraPreview = true);
+        _sendMcpReply(id, {
+          "content": [
+            {
+              "type": "text",
+              "text": '{"success": true, "active_camera": "$activeLens"}'
+            }
+          ],
+          "isError": false
+        });
+      } else if (toolName == 'self.camera.take_photo') {
         final question =
-            args['question']?.toString() ?? "Please describe this image";
+            args['question']?.toString() ?? "Describe what you see in detail";
+        final targetCam = args['camera']?.toString();
+        if (targetCam != null &&
+            targetCam.isNotEmpty &&
+            targetCam != _currentLensName) {
+          await _switchCameraLens(targetDirection: targetCam);
+        }
         final visionResult = await _captureAndUploadVision(question);
         _sendMcpReply(id, {
           "content": [
             {"type": "text", "text": visionResult}
+          ],
+          "isError": false
+        });
+      } else if (toolName == 'self.audio_speaker.set_volume') {
+        final vol = (args['volume'] as num?)?.toInt() ?? 80;
+        try {
+          await _deviceChannel.invokeMethod('setVolume', {"volume": vol});
+        } catch (_) {}
+        _sendMcpReply(id, {
+          "content": [
+            {"type": "text", "text": '{"success": true, "volume": $vol}'}
           ],
           "isError": false
         });
@@ -534,25 +826,38 @@ class _PetHomeScreenState extends State<PetHomeScreen>
   }
 
   Future<String> _captureAndUploadVision(String question) async {
+    if (_isCameraBusy) {
+      return '{"success": false, "message": "Camera is busy"}';
+    }
+    _isCameraBusy = true;
+
     try {
       if (_cameraController == null ||
           !_cameraController!.value.isInitialized) {
-        await _initCameraController();
+        await _initCamerasAfterPermission(preferFront: true);
       }
       if (_cameraController == null ||
           !_cameraController!.value.isInitialized) {
-        return '{"success": false, "message": "Camera not available"}';
+        _isCameraBusy = false;
+        return '{"success": false, "message": "Camera could not be initialized"}';
       }
 
       if (mounted) {
         setState(() {
-          currentEmotion = PetEmotion.surprised;
-          statusSubtitle = "📸 Mengambil foto kamera untuk dilihat XiaoZhi...";
+          currentEmotion = XiaoZhiEmotion.surprised;
+          statusSubtitle =
+              "📸 Memotret dengan kamera ${_currentLensName == 'front' ? 'Selfie' : 'Belakang'}...";
         });
       }
 
+      // Beri jeda singkat agar sensor kamera stabil
+      await Future.delayed(const Duration(milliseconds: 250));
+      try {
+        await _cameraController!.setFlashMode(FlashMode.off);
+      } catch (_) {}
+
       final XFile photo = await _cameraController!.takePicture();
-      final bytes = await photo.readAsBytes();
+      final Uint8List bytes = await photo.readAsBytes();
 
       final targetUrl = visionExplainUrl.isNotEmpty
           ? visionExplainUrl
@@ -561,25 +866,32 @@ class _PetHomeScreenState extends State<PetHomeScreen>
       final req = http.MultipartRequest('POST', Uri.parse(targetUrl));
       req.headers['Device-Id'] = deviceMac;
       req.headers['Client-Id'] = clientId;
+      req.headers['User-Agent'] = 'bread-compact-wifi/1.0.0';
       if (visionExplainToken.isNotEmpty) {
         req.headers['Authorization'] = 'Bearer $visionExplainToken';
       }
       req.fields['question'] = question;
       req.files.add(
-        http.MultipartFile.fromBytes('file', bytes, filename: 'capture.jpg'),
+        http.MultipartFile.fromBytes(
+          'file',
+          bytes,
+          filename: 'camera.jpg',
+        ),
       );
 
       final streamedRes =
           await req.send().timeout(const Duration(seconds: 15));
       final body = await streamedRes.stream.bytesToString();
+      _isCameraBusy = false;
       return body;
     } catch (e) {
-      return '{"success": false, "message": "$e"}';
+      _isCameraBusy = false;
+      return '{"success": false, "message": "Camera error: $e"}';
     }
   }
 
   // =======================================================================
-  // 3. WAKE WORD HANDS-FREE ("HAI / HALO / HELLO [NAMA PET]") & STREAM OPUS
+  // 5. WAKE WORD HANDS-FREE & STREAMING MIKROFON OPUS
   // =======================================================================
   Future<void> _startWakeWordListener() async {
     if (sessionState != SessionState.standbyWakeWord) return;
@@ -590,8 +902,6 @@ class _PetHomeScreenState extends State<PetHomeScreen>
       await _wakeStt.listen(
         listenFor: const Duration(seconds: 30),
         pauseFor: const Duration(seconds: 5),
-        partialResults: true,
-        cancelOnError: false,
         onResult: (result) {
           final spoken = result.recognizedWords.toLowerCase().trim();
           if (_isWakePhraseDetected(spoken)) {
@@ -622,7 +932,6 @@ class _PetHomeScreenState extends State<PetHomeScreen>
     }
     _spawnParticle("✨", Colors.cyanAccent);
 
-    // Kirim sinyal Wake Word terdeteksi ke server XiaoZhi
     _ws?.add(jsonEncode({
       "session_id": sessionId,
       "type": "listen",
@@ -641,11 +950,11 @@ class _PetHomeScreenState extends State<PetHomeScreen>
 
     setState(() {
       sessionState = SessionState.listeningToUser;
-      currentEmotion = PetEmotion.happy;
-      statusSubtitle = "Mendengarkanmu... (Ketuk wajah untuk kembali Standby)";
+      isVoiceAudioActive = false;
+      currentEmotion = XiaoZhiEmotion.happy;
+      statusSubtitle = "Mendengarkanmu... (Ketuk wajah untuk Standby)";
     });
 
-    // Beritahu XiaoZhi bahwa aliran mikrofon Opus dimulai (mode auto-stop)
     _ws?.add(jsonEncode({
       "session_id": sessionId,
       "type": "listen",
@@ -671,13 +980,11 @@ class _PetHomeScreenState extends State<PetHomeScreen>
         return;
       }
 
-      // Konversi byte PCM16 Little-Endian ke Int16 sampel
       final bd = ByteData.sublistView(pcmBytes);
       for (int i = 0; i <= pcmBytes.length - 2; i += 2) {
         _pcmMicBuffer.add(bd.getInt16(i, Endian.little));
       }
 
-      // Frame 60ms pada 16kHz = 960 sampel per paket Opus
       while (_pcmMicBuffer.length >= 960) {
         final frameSamples =
             Int16List.fromList(_pcmMicBuffer.sublist(0, 960));
@@ -704,6 +1011,7 @@ class _PetHomeScreenState extends State<PetHomeScreen>
 
   Future<void> _returnToStandbyMode() async {
     await _stopMicOpusStream();
+    _voiceDecayTimer?.cancel();
     if (isXiaoZhiConnected && _ws != null) {
       _ws!.add(jsonEncode({
         "session_id": sessionId,
@@ -713,79 +1021,68 @@ class _PetHomeScreenState extends State<PetHomeScreen>
     }
     setState(() {
       sessionState = SessionState.standbyWakeWord;
-      currentEmotion = PetEmotion.normal;
+      isVoiceAudioActive = false;
+      currentEmotion = XiaoZhiEmotion.neutral;
       statusSubtitle = "Standby • Panggil \"Hai $wakePetName\" untuk bicara";
     });
     _startWakeWordListener();
   }
 
-  PetEmotion _mapXiaoZhiEmotion(String emo) {
-    switch (emo.toLowerCase()) {
-      case 'happy':
-      case 'laughing':
-      case 'funny':
-        return PetEmotion.happy;
-      case 'loving':
-      case 'kissy':
-        return PetEmotion.love;
-      case 'confident':
-      case 'cool':
-      case 'delicious':
-        return PetEmotion.excited;
-      case 'winking':
-      case 'silly':
-        return PetEmotion.wink;
-      case 'sad':
-        return PetEmotion.sad;
-      case 'crying':
-        return PetEmotion.crying;
-      case 'angry':
-        return PetEmotion.angry;
-      case 'surprised':
-      case 'shocked':
-        return PetEmotion.surprised;
-      case 'thinking':
-      case 'confused':
-        return PetEmotion.thinking;
-      case 'sleepy':
-      case 'relaxed':
-        return PetEmotion.sleepy;
-      default:
-        return PetEmotion.normal;
+  // Pemetaan 21 Emosi Resmi XiaoZhi
+  XiaoZhiEmotion _mapXiaoZhiEmotion(String emo) {
+    final clean = emo.toLowerCase().trim();
+    for (final val in XiaoZhiEmotion.values) {
+      if (val.name == clean) return val;
     }
+    return XiaoZhiEmotion.neutral;
   }
 
-  // =======================================================================
-  // 4. CUACA HUD, SENSOR GOYANG, & INTERAKSI WAJAH
-  // =======================================================================
-  Future<void> _fetchWeatherHud() async {
-    try {
-      double lat = -6.2088;
-      double lon = 106.8456;
-      String city = "Indonesia";
-
-      final geoRes = await http
-          .get(Uri.parse("http://ip-api.com/json"))
-          .timeout(const Duration(seconds: 5));
-      if (geoRes.statusCode == 200) {
-        final g = jsonDecode(geoRes.body);
-        lat = (g['lat'] as num?)?.toDouble() ?? lat;
-        lon = (g['lon'] as num?)?.toDouble() ?? lon;
-        city = g['city'] ?? city;
-      }
-
-      final wRes = await http
-          .get(Uri.parse(
-              "https://api.open-meteo.com/v1/forecast?latitude=$lat&longitude=$lon&current_weather=true"))
-          .timeout(const Duration(seconds: 5));
-      if (wRes.statusCode == 200) {
-        final w = jsonDecode(wRes.body)['current_weather'];
-        if (mounted) {
-          setState(() => weatherSummary = "${w['temperature']}°C • $city");
-        }
-      }
-    } catch (_) {
-      if (mounted) setState(() => weatherSummary = "XiaoZhi Online");
+  String _getXiaoZhiEmojiChar(XiaoZhiEmotion emo) {
+    switch (emo) {
+      case XiaoZhiEmotion.neutral:
+        return "😶";
+      case XiaoZhiEmotion.happy:
+        return "🙂";
+      case XiaoZhiEmotion.laughing:
+        return "😆";
+      case XiaoZhiEmotion.funny:
+        return "😂";
+      case XiaoZhiEmotion.sad:
+        return "😔";
+      case XiaoZhiEmotion.angry:
+        return "😠";
+      case XiaoZhiEmotion.crying:
+        return "😭";
+      case XiaoZhiEmotion.loving:
+        return "😍";
+      case XiaoZhiEmotion.embarrassed:
+        return "😳";
+      case XiaoZhiEmotion.surprised:
+        return "😲";
+      case XiaoZhiEmotion.shocked:
+        return "😱";
+      case XiaoZhiEmotion.thinking:
+        return "🤔";
+      case XiaoZhiEmotion.winking:
+        return "😉";
+      case XiaoZhiEmotion.cool:
+        return "😎";
+      case XiaoZhiEmotion.relaxed:
+        return "😌";
+      case XiaoZhiEmotion.delicious:
+        return "🤤";
+      case XiaoZhiEmotion.kissy:
+        return "😘";
+      case XiaoZhiEmotion.confident:
+        return "😏";
+      case XiaoZhiEmotion.sleepy:
+        return "😴";
+      case XiaoZhiEmotion.silly:
+        return "😜";
+      case XiaoZhiEmotion.confused:
+        return "🙄";
+      case XiaoZhiEmotion.dizzy:
+        return "😵‍💫";
     }
   }
 
@@ -797,7 +1094,7 @@ class _PetHomeScreenState extends State<PetHomeScreen>
         final now = DateTime.now();
         if (now.difference(_lastShakeTime).inSeconds > 3) {
           _lastShakeTime = now;
-          setState(() => currentEmotion = PetEmotion.dizzy);
+          setState(() => currentEmotion = XiaoZhiEmotion.dizzy);
           _spawnParticle("💫", Colors.yellowAccent);
         }
       }
@@ -885,19 +1182,18 @@ class _PetHomeScreenState extends State<PetHomeScreen>
     final leftEyeCenter = Offset(centerX - 75, centerY - 20);
     final rightEyeCenter = Offset(centerX + 75, centerY - 20);
 
-    if ((local - leftEyeCenter).distance < 45 ||
-        (local - rightEyeCenter).distance < 45) {
-      setState(() => currentEmotion = PetEmotion.angry);
+    if (!useEmojiStyle &&
+        ((local - leftEyeCenter).distance < 45 ||
+            (local - rightEyeCenter).distance < 45)) {
+      setState(() => currentEmotion = XiaoZhiEmotion.angry);
       _spawnParticle("💢", Colors.redAccent);
       return;
     }
 
-    // Jika sedang dalam sesi obrolan aktif, ketuk wajah untuk kembali ke Standby
     if (sessionState != SessionState.standbyWakeWord) {
       _returnToStandbyMode();
     } else {
-      // Jika sedang standby, ketuk wajah juga bisa membangunkan XiaoZhi
-      _triggerWakeUpToXiaoZhi("Halo $wakePetName");
+      _triggerWakeUpToXiaoZhi("Hai $wakePetName");
     }
   }
 
@@ -914,7 +1210,7 @@ class _PetHomeScreenState extends State<PetHomeScreen>
       rubCounter++;
       if (rubCounter % 14 == 0) {
         _spawnParticle("❤️", Colors.pinkAccent);
-        setState(() => currentEmotion = PetEmotion.love);
+        setState(() => currentEmotion = XiaoZhiEmotion.loving);
       }
     }
   }
@@ -935,6 +1231,7 @@ class _PetHomeScreenState extends State<PetHomeScreen>
     _idleTimer?.cancel();
     _particleTimer?.cancel();
     _wakeRestartTimer?.cancel();
+    _voiceDecayTimer?.cancel();
     _accelSub?.cancel();
     _micStreamSub?.cancel();
     _micRecorder.dispose();
@@ -945,9 +1242,10 @@ class _PetHomeScreenState extends State<PetHomeScreen>
 
   @override
   Widget build(BuildContext context) {
-    final baseColor = currentEmotion == PetEmotion.angry
+    final baseColor = currentEmotion == XiaoZhiEmotion.angry
         ? Colors.redAccent
-        : currentEmotion == PetEmotion.love
+        : (currentEmotion == XiaoZhiEmotion.loving ||
+                currentEmotion == XiaoZhiEmotion.kissy)
             ? Colors.pinkAccent
             : themeColors[themeColorIndex];
 
@@ -957,7 +1255,7 @@ class _PetHomeScreenState extends State<PetHomeScreen>
           children: [
             Column(
               children: [
-                // HUD Bar Atas (Status XiaoZhi, Jam/Cuaca, Kamera Vision, Pairing)
+                // HUD Bar Atas (Status XiaoZhi, Lokasi GPS Asli, Jam, Kamera, Pairing)
                 Padding(
                   padding:
                       const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
@@ -995,26 +1293,29 @@ class _PetHomeScreenState extends State<PetHomeScreen>
                             ),
                           ),
                           const SizedBox(width: 8),
-                          Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              Text(
-                                "HAI ${wakePetName.toUpperCase()}",
-                                style: TextStyle(
-                                  fontSize: 13,
-                                  fontWeight: FontWeight.bold,
-                                  letterSpacing: 1.1,
-                                  color: baseColor,
+                          GestureDetector(
+                            onTap: _fetchHardwareGpsAndWeather,
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Text(
+                                  "HAI ${wakePetName.toUpperCase()}",
+                                  style: TextStyle(
+                                    fontSize: 13,
+                                    fontWeight: FontWeight.bold,
+                                    letterSpacing: 1.1,
+                                    color: baseColor,
+                                  ),
                                 ),
-                              ),
-                              Text(
-                                weatherSummary,
-                                style: const TextStyle(
-                                  fontSize: 10,
-                                  color: Colors.white60,
+                                Text(
+                                  weatherSummary,
+                                  style: const TextStyle(
+                                    fontSize: 10,
+                                    color: Colors.white60,
+                                  ),
                                 ),
-                              ),
-                            ],
+                              ],
+                            ),
                           ),
                         ],
                       ),
@@ -1048,8 +1349,13 @@ class _PetHomeScreenState extends State<PetHomeScreen>
                                   ? Colors.greenAccent
                                   : Colors.white54,
                             ),
-                            tooltip: "Intip Kamera Vision",
-                            onPressed: () {
+                            tooltip: "Preview Kamera Vision",
+                            onPressed: () async {
+                              if (_cameraController == null ||
+                                  !_cameraController!.value.isInitialized) {
+                                await _initCamerasAfterPermission(
+                                    preferFront: true);
+                              }
                               setState(
                                   () => showCameraPreview = !showCameraPreview);
                             },
@@ -1063,7 +1369,7 @@ class _PetHomeScreenState extends State<PetHomeScreen>
                           ),
                           IconButton(
                             icon: const Icon(Icons.tune, color: Colors.white70),
-                            tooltip: "Atur Wake Word & Warna",
+                            tooltip: "Atur Wake Word & Mode Wajah",
                             onPressed: _showWakeSettingsDialog,
                           ),
                         ],
@@ -1072,7 +1378,7 @@ class _PetHomeScreenState extends State<PetHomeScreen>
                   ),
                 ),
 
-                // Area Wajah Robot Ekspresif
+                // Area Wajah (Mode Robot Neon 21 Ekspresi ATAU Mode Emoji Animasi XiaoZhi)
                 Expanded(
                   child: LayoutBuilder(
                     builder: (context, constraints) {
@@ -1093,6 +1399,57 @@ class _PetHomeScreenState extends State<PetHomeScreen>
                                 _talkController,
                               ]),
                               builder: (context, child) {
+                                final double activeTalk = isVoiceAudioActive
+                                    ? _talkController.value
+                                    : 0.0;
+
+                                if (useEmojiStyle) {
+                                  // Mode Animasi Emoji Bawaan XiaoZhi
+                                  final scale =
+                                      1.0 + (activeTalk * 0.14);
+                                  return Transform.translate(
+                                    offset: Offset(
+                                      gazeOffset.dx * 14,
+                                      (_floatController.value - 0.5) * 16 +
+                                          gazeOffset.dy * 10,
+                                    ),
+                                    child: Transform.scale(
+                                      scale: scale,
+                                      child: Column(
+                                        mainAxisSize: MainAxisSize.min,
+                                        children: [
+                                          Text(
+                                            _getXiaoZhiEmojiChar(
+                                                currentEmotion),
+                                            style: const TextStyle(
+                                                fontSize: 135),
+                                          ),
+                                          const SizedBox(height: 8),
+                                          Container(
+                                            padding: const EdgeInsets.symmetric(
+                                                horizontal: 12, vertical: 4),
+                                            decoration: BoxDecoration(
+                                              color: baseColor.withOpacity(0.15),
+                                              borderRadius:
+                                                  BorderRadius.circular(12),
+                                            ),
+                                            child: Text(
+                                              currentEmotion.name.toUpperCase(),
+                                              style: TextStyle(
+                                                fontSize: 11,
+                                                letterSpacing: 1.5,
+                                                color: baseColor,
+                                                fontWeight: FontWeight.bold,
+                                              ),
+                                            ),
+                                          ),
+                                        ],
+                                      ),
+                                    ),
+                                  );
+                                }
+
+                                // Mode Wajah Robot Neon 21 Ekspresi (Bebas Tumpuk)
                                 return Transform.translate(
                                   offset: Offset(
                                     gazeOffset.dx * 12,
@@ -1100,14 +1457,12 @@ class _PetHomeScreenState extends State<PetHomeScreen>
                                         gazeOffset.dy * 8,
                                   ),
                                   child: CustomPaint(
-                                    size: const Size(320, 220),
+                                    size: const Size(320, 230),
                                     painter: RobotFacePainter(
                                       emotion: currentEmotion,
                                       blinkValue: _blinkController.value,
-                                      talkValue: sessionState ==
-                                              SessionState.speakingTts
-                                          ? _talkController.value
-                                          : 0.0,
+                                      isTalking: isVoiceAudioActive,
+                                      talkValue: activeTalk,
                                       gazeOffset: gazeOffset,
                                       faceColor: baseColor,
                                     ),
@@ -1139,7 +1494,7 @@ class _PetHomeScreenState extends State<PetHomeScreen>
                   ),
                 ),
 
-                // Indikator Status Hands-Free & Subtitle XiaoZhi (Tanpa Tombol Mic)
+                // Indikator Status & Subtitle XiaoZhi
                 Padding(
                   padding:
                       const EdgeInsets.only(bottom: 22, left: 24, right: 24),
@@ -1153,7 +1508,7 @@ class _PetHomeScreenState extends State<PetHomeScreen>
                       border: Border.all(
                         color: sessionState == SessionState.listeningToUser
                             ? Colors.greenAccent
-                            : sessionState == SessionState.speakingTts
+                            : isVoiceAudioActive
                                 ? Colors.cyanAccent
                                 : Colors.white24,
                         width: sessionState == SessionState.standbyWakeWord
@@ -1171,7 +1526,7 @@ class _PetHomeScreenState extends State<PetHomeScreen>
               ],
             ),
 
-            // Jendela Kecil Preview Kamera Vision (Jika Diaktifkan)
+            // Jendela Preview Kamera Vision (Ketuk untuk Ganti Selfie <-> Belakang)
             if (showCameraPreview &&
                 _cameraController != null &&
                 _cameraController!.value.isInitialized)
@@ -1179,10 +1534,10 @@ class _PetHomeScreenState extends State<PetHomeScreen>
                 right: 16,
                 bottom: 90,
                 child: GestureDetector(
-                  onTap: _switchCameraLens,
+                  onTap: () => _switchCameraLens(),
                   child: Container(
-                    width: 110,
-                    height: 150,
+                    width: 115,
+                    height: 155,
                     decoration: BoxDecoration(
                       borderRadius: BorderRadius.circular(16),
                       border: Border.all(color: baseColor, width: 2),
@@ -1193,8 +1548,29 @@ class _PetHomeScreenState extends State<PetHomeScreen>
                       children: [
                         CameraPreview(_cameraController!),
                         Positioned(
-                          bottom: 4,
-                          right: 4,
+                          top: 6,
+                          left: 6,
+                          child: Container(
+                            padding: const EdgeInsets.symmetric(
+                                horizontal: 6, vertical: 2),
+                            decoration: BoxDecoration(
+                              color: Colors.black54,
+                              borderRadius: BorderRadius.circular(8),
+                            ),
+                            child: Text(
+                              _currentLensName == 'front'
+                                  ? "SELFIE"
+                                  : "BELAKANG",
+                              style: const TextStyle(
+                                  fontSize: 9,
+                                  color: Colors.white,
+                                  fontWeight: FontWeight.bold),
+                            ),
+                          ),
+                        ),
+                        Positioned(
+                          bottom: 6,
+                          right: 6,
                           child: Container(
                             padding: const EdgeInsets.all(4),
                             decoration: const BoxDecoration(
@@ -1273,49 +1649,63 @@ class _PetHomeScreenState extends State<PetHomeScreen>
   void _showWakeSettingsDialog() {
     final wakeCtrl = TextEditingController(text: wakePetName);
     int selectedColor = themeColorIndex;
+    bool tempEmojiStyle = useEmojiStyle;
 
     showDialog(
       context: context,
       builder: (context) => StatefulBuilder(
         builder: (context, setDialogState) => AlertDialog(
-          title: const Text("Wake Word & Tampilan"),
-          content: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              const Text("Warna Mata Neon:", style: TextStyle(fontSize: 13)),
-              const SizedBox(height: 10),
-              Row(
-                mainAxisAlignment: MainAxisAlignment.spaceAround,
-                children: List.generate(themeColors.length, (idx) {
-                  return GestureDetector(
-                    onTap: () => setDialogState(() => selectedColor = idx),
-                    child: CircleAvatar(
-                      radius: 16,
-                      backgroundColor: themeColors[idx],
-                      child: selectedColor == idx
-                          ? const Icon(Icons.check,
-                              color: Colors.black, size: 18)
-                          : null,
-                    ),
-                  );
-                }),
-              ),
-              const SizedBox(height: 18),
-              TextField(
-                controller: wakeCtrl,
-                decoration: const InputDecoration(
-                  labelText: "Nama Panggilan (Sesuai Web XiaoZhi)",
-                  helperText:
-                      "Panggil dengan: \"Hai / Halo / Hello [Nama ini]\"",
+          title: const Text("Wake Word & Mode Wajah"),
+          content: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text("Warna Mata Neon:", style: TextStyle(fontSize: 13)),
+                const SizedBox(height: 10),
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceAround,
+                  children: List.generate(themeColors.length, (idx) {
+                    return GestureDetector(
+                      onTap: () => setDialogState(() => selectedColor = idx),
+                      child: CircleAvatar(
+                        radius: 16,
+                        backgroundColor: themeColors[idx],
+                        child: selectedColor == idx
+                            ? const Icon(Icons.check,
+                                color: Colors.black, size: 18)
+                            : null,
+                      ),
+                    );
+                  }),
                 ),
-              ),
-              const SizedBox(height: 12),
-              Text(
-                "MAC Address: $deviceMac",
-                style: const TextStyle(fontSize: 11, color: Colors.white54),
-              ),
-            ],
+                const SizedBox(height: 16),
+                SwitchListTile(
+                  contentPadding: EdgeInsets.zero,
+                  title: const Text("Gunakan Emoji Bawaan XiaoZhi",
+                      style: TextStyle(fontSize: 13)),
+                  subtitle: const Text(
+                      "Aktif: 21 Emoji XiaoZhi • Nonaktif: Wajah Robot Neon",
+                      style: TextStyle(fontSize: 11)),
+                  value: tempEmojiStyle,
+                  onChanged: (v) => setDialogState(() => tempEmojiStyle = v),
+                ),
+                const SizedBox(height: 10),
+                TextField(
+                  controller: wakeCtrl,
+                  decoration: const InputDecoration(
+                    labelText: "Nama Panggilan (Sesuai Web XiaoZhi)",
+                    helperText:
+                        "Panggil dengan: \"Hai / Halo / Hello [Nama ini]\"",
+                  ),
+                ),
+                const SizedBox(height: 12),
+                Text(
+                  "Lokasi GPS: $locationName\nMAC Address: $deviceMac",
+                  style: const TextStyle(fontSize: 11, color: Colors.white54),
+                ),
+              ],
+            ),
           ),
           actions: [
             TextButton(
@@ -1326,13 +1716,15 @@ class _PetHomeScreenState extends State<PetHomeScreen>
               onPressed: () async {
                 final prefs = await SharedPreferences.getInstance();
                 final newWake = wakeCtrl.text.trim().isEmpty
-                    ? "xiaozhi"
+                    ? "kimmi"
                     : wakeCtrl.text.trim();
                 await prefs.setString('wakePetName', newWake);
                 await prefs.setInt('themeColorIndex', selectedColor);
+                await prefs.setBool('useEmojiStyle', tempEmojiStyle);
                 setState(() {
                   wakePetName = newWake;
                   themeColorIndex = selectedColor;
+                  useEmojiStyle = tempEmojiStyle;
                   if (sessionState == SessionState.standbyWakeWord) {
                     statusSubtitle =
                         "Standby • Panggil \"Hai $wakePetName\" untuk bicara";
@@ -1350,8 +1742,9 @@ class _PetHomeScreenState extends State<PetHomeScreen>
 }
 
 class RobotFacePainter extends CustomPainter {
-  final PetEmotion emotion;
+  final XiaoZhiEmotion emotion;
   final double blinkValue;
+  final bool isTalking;
   final double talkValue;
   final Offset gazeOffset;
   final Color faceColor;
@@ -1359,6 +1752,7 @@ class RobotFacePainter extends CustomPainter {
   RobotFacePainter({
     required this.emotion,
     required this.blinkValue,
+    required this.isTalking,
     required this.talkValue,
     required this.gazeOffset,
     required this.faceColor,
@@ -1388,7 +1782,12 @@ class RobotFacePainter extends CustomPainter {
     _drawCustomEye(
         canvas, rightCenter, eyeWidth, eyeHeight, paint, glowPaint, false);
 
-    if (emotion == PetEmotion.love || emotion == PetEmotion.happy) {
+    // Pipi merona untuk ekspresi ceria / sayang / malu
+    if (emotion == XiaoZhiEmotion.loving ||
+        emotion == XiaoZhiEmotion.kissy ||
+        emotion == XiaoZhiEmotion.happy ||
+        emotion == XiaoZhiEmotion.embarrassed ||
+        emotion == XiaoZhiEmotion.delicious) {
       final blushPaint = Paint()
         ..color = Colors.pinkAccent.withOpacity(0.45)
         ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 10);
@@ -1404,6 +1803,32 @@ class RobotFacePainter extends CustomPainter {
       );
     }
 
+    // Air mata untuk crying
+    if (emotion == XiaoZhiEmotion.crying) {
+      final tearPaint = Paint()..color = Colors.lightBlueAccent;
+      canvas.drawOval(
+        Rect.fromCenter(
+            center: leftCenter.translate(0, 54), width: 12, height: 22),
+        tearPaint,
+      );
+      canvas.drawOval(
+        Rect.fromCenter(
+            center: rightCenter.translate(0, 54), width: 12, height: 22),
+        tearPaint,
+      );
+    }
+
+    // Kacamata jembatan untuk mode Cool
+    if (emotion == XiaoZhiEmotion.cool) {
+      final bridgePaint = Paint()
+        ..color = faceColor
+        ..strokeWidth = 6
+        ..style = PaintingStyle.stroke;
+      canvas.drawLine(
+          leftCenter.translate(34, -8), rightCenter.translate(-34, -8), bridgePaint);
+    }
+
+    // Gambar Mulut Tunggal (Anti-Tumpuk)
     _drawMouth(canvas, size, gazeShift * 0.5);
   }
 
@@ -1415,7 +1840,10 @@ class RobotFacePainter extends CustomPainter {
       ..strokeWidth = 9
       ..strokeCap = StrokeCap.round;
 
-    if (emotion == PetEmotion.wink && !isLeft) {
+    if ((emotion == XiaoZhiEmotion.winking ||
+            emotion == XiaoZhiEmotion.kissy ||
+            emotion == XiaoZhiEmotion.silly) &&
+        !isLeft) {
       canvas.drawArc(
         Rect.fromCenter(center: center, width: w, height: 25),
         pi,
@@ -1426,7 +1854,11 @@ class RobotFacePainter extends CustomPainter {
       return;
     }
 
-    if (emotion == PetEmotion.happy) {
+    if (emotion == XiaoZhiEmotion.happy ||
+        emotion == XiaoZhiEmotion.laughing ||
+        emotion == XiaoZhiEmotion.funny ||
+        emotion == XiaoZhiEmotion.relaxed ||
+        emotion == XiaoZhiEmotion.delicious) {
       canvas.drawArc(
         Rect.fromCenter(center: center.translate(0, 10), width: w, height: 55),
         pi,
@@ -1437,7 +1869,7 @@ class RobotFacePainter extends CustomPainter {
       return;
     }
 
-    if (emotion == PetEmotion.dizzy) {
+    if (emotion == XiaoZhiEmotion.dizzy) {
       double r = 24;
       canvas.drawLine(
           center.translate(-r, -r), center.translate(r, r), strokePaint);
@@ -1446,7 +1878,7 @@ class RobotFacePainter extends CustomPainter {
       return;
     }
 
-    if (emotion == PetEmotion.love) {
+    if (emotion == XiaoZhiEmotion.loving) {
       final path = Path();
       double s = 34;
       path.moveTo(center.dx, center.dy + s * 0.8);
@@ -1459,24 +1891,32 @@ class RobotFacePainter extends CustomPainter {
       return;
     }
 
-    if (emotion == PetEmotion.sleepy) {
+    if (emotion == XiaoZhiEmotion.sleepy) {
       h *= 0.22;
-    } else if (emotion == PetEmotion.surprised) {
-      w = 72;
-      h = 72 * (1.0 - blinkValue * 0.9);
-    } else if (emotion == PetEmotion.excited) {
-      h *= 1.15;
+    } else if (emotion == XiaoZhiEmotion.surprised ||
+        emotion == XiaoZhiEmotion.shocked) {
+      w = 74;
+      h = 74 * (1.0 - blinkValue * 0.9);
+    } else if (emotion == XiaoZhiEmotion.confused && isLeft) {
+      h *= 0.65;
+    } else if (emotion == XiaoZhiEmotion.cool) {
+      h *= 0.68;
     }
 
     final rect = RRect.fromRectAndRadius(
       Rect.fromCenter(center: center, width: w, height: h),
-      Radius.circular(emotion == PetEmotion.surprised ? 40 : 24),
+      Radius.circular(
+          (emotion == XiaoZhiEmotion.surprised ||
+                  emotion == XiaoZhiEmotion.shocked)
+              ? 40
+              : 22),
     );
     canvas.drawRRect(rect, glowPaint);
     canvas.drawRRect(rect, paint);
 
     final maskPaint = Paint()..color = Colors.black;
-    if (emotion == PetEmotion.angry) {
+    if (emotion == XiaoZhiEmotion.angry ||
+        emotion == XiaoZhiEmotion.confident) {
       final path = Path();
       if (isLeft) {
         path.moveTo(center.dx - w, center.dy - h);
@@ -1491,7 +1931,9 @@ class RobotFacePainter extends CustomPainter {
       }
       path.close();
       canvas.drawPath(path, maskPaint);
-    } else if (emotion == PetEmotion.sad || emotion == PetEmotion.crying) {
+    } else if (emotion == XiaoZhiEmotion.sad ||
+        emotion == XiaoZhiEmotion.crying ||
+        emotion == XiaoZhiEmotion.embarrassed) {
       final path = Path();
       if (isLeft) {
         path.moveTo(center.dx - w, center.dy - h);
@@ -1501,7 +1943,7 @@ class RobotFacePainter extends CustomPainter {
       } else {
         path.moveTo(center.dx - w, center.dy - h);
         path.lineTo(center.dx + w, center.dy - h);
-        path.lineTo(center.dx - w, center.dy - 5);
+        path.lineTo(center.dx + w, center.dy - 5);
         path.lineTo(center.dx - w, center.dy - h * 0.55);
       }
       path.close();
@@ -1521,11 +1963,16 @@ class RobotFacePainter extends CustomPainter {
       ..color = faceColor
       ..style = PaintingStyle.fill;
 
-    if (talkValue > 0.05) {
-      double openH = 14 + (talkValue * 28);
+    // 1. Jika sedang mengeluarkan suara bicara (isTalking == true),
+    // HANYA gambar 1 bentuk mulut kapsul dinamis dari tinggi 8px -> 36px.
+    // Tidak pernah berganti ke garis lengkung di tengah kalimat sehingga bebas tumpuk!
+    if (isTalking) {
+      final double openHeight = 10.0 + (talkValue * 28.0);
+      final double openWidth = 42.0 + (talkValue * 14.0);
       canvas.drawRRect(
         RRect.fromRectAndRadius(
-          Rect.fromCenter(center: mouthCenter, width: 48, height: openH),
+          Rect.fromCenter(
+              center: mouthCenter, width: openWidth, height: openHeight),
           const Radius.circular(18),
         ),
         fillPaint,
@@ -1533,59 +1980,116 @@ class RobotFacePainter extends CustomPainter {
       return;
     }
 
+    // 2. Jika sedang diam (tidak ada suara keluar), gambar mulut sesuai 21 emosi XiaoZhi:
     switch (emotion) {
-      case PetEmotion.happy:
-      case PetEmotion.love:
-      case PetEmotion.excited:
-      case PetEmotion.wink:
-        canvas.drawArc(
-          Rect.fromCenter(center: mouthCenter, width: 62, height: 42),
-          0,
-          pi,
-          false,
-          strokePaint,
-        );
+      case XiaoZhiEmotion.laughing:
+      case XiaoZhiEmotion.funny:
+        final path = Path()
+          ..moveTo(mouthCenter.dx - 32, mouthCenter.dy - 6)
+          ..lineTo(mouthCenter.dx + 32, mouthCenter.dy - 6)
+          ..arcToPoint(
+            Offset(mouthCenter.dx - 32, mouthCenter.dy - 6),
+            radius: const Radius.circular(32),
+            clockwise: true,
+          )
+          ..close();
+        canvas.drawPath(path, fillPaint);
         break;
-      case PetEmotion.angry:
-      case PetEmotion.sad:
-      case PetEmotion.crying:
+
+      case XiaoZhiEmotion.happy:
+      case XiaoZhiEmotion.loving:
+      case XiaoZhiEmotion.winking:
+      case XiaoZhiEmotion.relaxed:
+      case XiaoZhiEmotion.confident:
+      case XiaoZhiEmotion.cool:
         canvas.drawArc(
           Rect.fromCenter(
-              center: mouthCenter.translate(0, 16), width: 52, height: 32),
-          pi,
-          pi,
-          false,
-          strokePaint,
-        );
-        break;
-      case PetEmotion.surprised:
-      case PetEmotion.dizzy:
-        canvas.drawOval(
-          Rect.fromCenter(center: mouthCenter, width: 28, height: 32),
-          strokePaint,
-        );
-        break;
-      case PetEmotion.thinking:
-        canvas.drawLine(
-          mouthCenter.translate(-22, 5),
-          mouthCenter.translate(20, -6),
-          strokePaint,
-        );
-        break;
-      case PetEmotion.sleepy:
-        canvas.drawOval(
-          Rect.fromCenter(center: mouthCenter, width: 18, height: 18),
-          strokePaint,
-        );
-        break;
-      default:
-        canvas.drawArc(
-          Rect.fromCenter(center: mouthCenter, width: 44, height: 22),
+              center: mouthCenter.translate(0, -6), width: 58, height: 34),
           0,
           pi,
           false,
           strokePaint,
         );
+        break;
+
+      case XiaoZhiEmotion.delicious:
+      case XiaoZhiEmotion.silly:
+        // Senyum dengan lidah menjulur
+        canvas.drawArc(
+          Rect.fromCenter(
+              center: mouthCenter.translate(0, -6), width: 56, height: 30),
+          0,
+          pi,
+          false,
+          strokePaint,
+        );
+        final tonguePaint = Paint()..color = Colors.pinkAccent;
+        canvas.drawRRect(
+          RRect.fromRectAndRadius(
+            Rect.fromCenter(
+                center: mouthCenter.translate(6, 12), width: 20, height: 22),
+            const Radius.circular(10),
+          ),
+          tonguePaint,
+        );
+        break;
+
+      case XiaoZhiEmotion.kissy:
+        canvas.drawOval(
+          Rect.fromCenter(center: mouthCenter, width: 20, height: 22),
+          strokePaint,
+        );
+        break;
+
+      case XiaoZhiEmotion.angry:
+      case XiaoZhiEmotion.sad:
+      case XiaoZhiEmotion.crying:
+        canvas.drawArc(
+          Rect.fromCenter(
+              center: mouthCenter.translate(0, 14), width: 50, height: 28),
+          pi,
+          pi,
+          false,
+          strokePaint,
+        );
+        break;
+
+      case XiaoZhiEmotion.surprised:
+      case XiaoZhiEmotion.shocked:
+      case XiaoZhiEmotion.dizzy:
+        canvas.drawOval(
+          Rect.fromCenter(center: mouthCenter, width: 30, height: 34),
+          strokePaint,
+        );
+        break;
+
+      case XiaoZhiEmotion.thinking:
+      case XiaoZhiEmotion.confused:
+      case XiaoZhiEmotion.embarrassed:
+        canvas.drawLine(
+          mouthCenter.translate(-22, 4),
+          mouthCenter.translate(22, -4),
+          strokePaint,
+        );
+        break;
+
+      case XiaoZhiEmotion.sleepy:
+        canvas.drawOval(
+          Rect.fromCenter(center: mouthCenter, width: 16, height: 16),
+          strokePaint,
+        );
+        break;
+
+      case XiaoZhiEmotion.neutral:
+        canvas.drawArc(
+          Rect.fromCenter(
+              center: mouthCenter.translate(0, -4), width: 42, height: 18),
+          0,
+          pi,
+          false,
+          strokePaint,
+        );
+        break;
     }
   }
 
