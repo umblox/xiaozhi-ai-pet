@@ -21,10 +21,10 @@ jobs:
           distribution: 'temurin'
           java-version: '17'
 
-      - name: Setup Flutter
+      - name: Setup Flutter 3.27
         uses: subosito/flutter-action@v2
         with:
-          flutter-version: '3.24.5'
+          flutter-version: '3.27.4'
           channel: 'stable'
           cache: true
 
@@ -39,9 +39,25 @@ jobs:
           cp /tmp/backup/pubspec.yaml .
           cp -r /tmp/backup/lib/* lib/
 
-      - name: Configure Android Manifest, SDK 35 & Root Gradle Patch
+      - name: Fetch Dependencies
+        run: flutter pub get
+
+      - name: Patch Android SDK 35, NDK & Plugin Pub-Cache
         run: |
-          python3 -c '
+          python3 - << 'EOF'
+          import os
+          import re
+
+          # 1. Pastikan kompatibilitas parameter speech_to_text 7.4.0 di lib/main.dart
+          main_dart = "lib/main.dart"
+          if os.path.exists(main_dart):
+              with open(main_dart, "r") as f:
+                  code = f.read()
+              code = code.replace("partialResults: true,", "").replace("cancelOnError: false,", "")
+              with open(main_dart, "w") as f:
+                  f.write(code)
+
+          # 2. Suntikkan Permission ke AndroidManifest.xml utama
           manifest_path = "android/app/src/main/AndroidManifest.xml"
           with open(manifest_path, "r") as f:
               content = f.read()
@@ -55,46 +71,65 @@ jobs:
           """
           if "android.permission.INTERNET" not in content:
               content = content.replace("<application", permissions + "\n    <application", 1)
-          content = content.replace("android:label=\"xiaozhi_pet\"", "android:label=\"XiaoZhi AI Pet\"")
+          content = content.replace('android:label="xiaozhi_pet"', 'android:label="XiaoZhi AI Pet"')
           with open(manifest_path, "w") as f:
               f.write(content)
 
+          # 3. Tambahkan toleransi JVM target di gradle.properties
+          prop_path = "android/gradle.properties"
+          with open(prop_path, "a") as f:
+              f.write("\nkotlin.jvm.target.validation.mode=warning\n")
+
+          # 4. Set SDK 35, minSdk 23, dan NDK di android/app/build.gradle
           gradle_path = "android/app/build.gradle"
           with open(gradle_path, "r") as f:
               g = f.read()
+          g = g.replace("flutter.compileSdkVersion", "35")
+          g = g.replace("flutter.targetSdkVersion", "35")
           g = g.replace("flutter.minSdkVersion", "23")
+          g = g.replace("flutter.ndkVersion", '"25.1.8937393"')
           with open(gradle_path, "w") as f:
               f.write(g)
 
-          root_gradle = "android/build.gradle"
-          with open(root_gradle, "r") as f:
-              rg = f.read()
-          if "subprojects {" not in rg:
-              rg += """
-          subprojects {
-              afterEvaluate { project ->
-                  if (project.hasProperty(\x27android\x27)) {
-                      project.android {
-                          if (namespace == null) {
-                              namespace project.group
-                          }
-                          compileSdk = 35
-                          defaultConfig {
-                              minSdk = 23
-                              targetSdk = 35
-                          }
-                      }
-                  }
-              }
-          }
-          """
-              with open(root_gradle, "w") as f:
-                  f.write(rg)
-          '
+          # 5. Tambal seluruh build.gradle plugin di ~/.pub-cache (termasuk flutter.ndkVersion & namespace)
+          pub_cache = os.path.expanduser("~/.pub-cache")
+          for root, dirs, files in os.walk(pub_cache):
+              if "build.gradle" in files:
+                  bg_path = os.path.join(root, "build.gradle")
+                  try:
+                      with open(bg_path, "r") as f:
+                          bg = f.read()
+                      orig = bg
+                      bg = bg.replace("flutter.compileSdkVersion", "35")
+                      bg = bg.replace("flutter.targetSdkVersion", "35")
+                      bg = bg.replace("flutter.minSdkVersion", "23")
+                      bg = bg.replace("flutter.ndkVersion", '"25.1.8937393"')
+
+                      # Auto-inject namespace jika ada plugin lama yang belum punya namespace
+                      if "com.android.library" in bg and "namespace" not in bg:
+                          manifest_cand = os.path.join(root, "src", "main", "AndroidManifest.xml")
+                          if os.path.exists(manifest_cand):
+                              with open(manifest_cand, "r") as mf:
+                                  m_txt = mf.read()
+                              m = re.search(r'package\s*=\s*"([^"]+)"', m_txt)
+                              if m:
+                                  pkg_name = m.group(1)
+                                  bg = bg.replace("android {", f'android {{\n    namespace "{pkg_name}"', 1)
+                                  m_txt_clean = re.sub(r'\s*package\s*=\s*"[^"]+"', '', m_txt, count=1)
+                                  with open(manifest_cand, "w") as mf:
+                                      mf.write(m_txt_clean)
+
+                      if bg != orig:
+                          with open(bg_path, "w") as f:
+                              f.write(bg)
+                          print(f"Patched plugin: {bg_path}")
+                  except Exception as e:
+                      print(f"Skip {bg_path}: {e}")
+          EOF
 
       - name: Build Release APK
         run: |
-          flutter build apk --release
+          flutter build apk --release --no-pub
           cp build/app/outputs/flutter-apk/app-release.apk xiaozhi-ai-pet.apk
 
       - name: Upload APK Artifact
@@ -108,6 +143,6 @@ jobs:
         with:
           tag_name: latest-build
           name: "XiaoZhi AI Pet - Pure XiaoZhi Edition"
-          body: "Download langsung file **xiaozhi-ai-pet.apk** di bawah ini."
+          body: "Download langsung file **xiaozhi-ai-pet.apk** di bawah ini (100% Opus XiaoZhi Audio + Wake Word + MCP Camera Vision)."
           files: xiaozhi-ai-pet.apk
           prerelease: false
