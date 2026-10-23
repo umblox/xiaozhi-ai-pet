@@ -81,7 +81,7 @@ jobs:
           with open(manifest_path, "w") as f:
               f.write(content)
 
-          # 3. Suntikkan Jembatan Native GPS, Volume & YouTube Audio Streamer ke MainActivity.kt
+          # 3. Suntikkan Jembatan Native GPS, Volume & YouTube Audio Streamer (Dengan Dukungan Interupsi) ke MainActivity.kt
           kt_path = "android/app/src/main/kotlin/id/xiaozhi/aipet/xiaozhi_pet/MainActivity.kt"
           if os.path.exists(kt_path):
               kt_lines = [
@@ -118,12 +118,13 @@ jobs:
                   "    private var ytWebView: WebView? = null",
                   "    private val mainHandler = Handler(Looper.getMainLooper())",
                   "    private var ytIsPlaying = false",
+                  "    private var ytTargetVolume = 0.38",
                   "",
                   "    private val ytKeepAliveRunnable = object : Runnable {",
                   "        override fun run() {",
                   "            if (ytIsPlaying) {",
                   "                injectAutoPlayJs()",
-                  "                mainHandler.postDelayed(this, 1600)",
+                  "                mainHandler.postDelayed(this, 1500)",
                   "            }",
                   "        }",
                   "    }",
@@ -166,8 +167,17 @@ jobs:
                   "",
                   "    private fun injectAutoPlayJs() {",
                   "        if (!ytIsPlaying) return",
-                  "        val js = \"(function(){try{var s=document.querySelector('.ytp-ad-skip-button,.ytp-ad-skip-button-modern,.videoAdUiSkipButton');if(s)s.click();var v=document.querySelector('video');if(v){v.muted=false;v.volume=1.0;if(v.paused)v.play();}}catch(e){}})();\"",
+                  "        val js = \"(function(){try{var s=document.querySelector('.ytp-ad-skip-button,.ytp-ad-skip-button-modern,.videoAdUiSkipButton');if(s)s.click();var v=document.querySelector('video');if(v){v.muted=false;v.volume=$ytTargetVolume;if(v.paused)v.play();}}catch(e){}})();\"",
                   "        ytWebView?.evaluateJavascript(js, null)",
+                  "    }",
+                  "",
+                  "    private fun releaseAudioFocusForMic() {",
+                  "        try {",
+                  "            val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager",
+                  "            am.mode = AudioManager.MODE_NORMAL",
+                  "            @Suppress(\"DEPRECATION\")",
+                  "            am.abandonAudioFocus(null)",
+                  "        } catch (_: Exception) {}",
                   "    }",
                   "",
                   "    @SuppressLint(\"MissingPermission\")",
@@ -276,6 +286,7 @@ jobs:
                   "                        mainHandler.post {",
                   "                            val wv = ensureYtWebView()",
                   "                            ytIsPlaying = true",
+                  "                            ytTargetVolume = 0.38",
                   "                            mainHandler.removeCallbacks(ytKeepAliveRunnable)",
                   "                            if (videoId.isNotEmpty()) {",
                   "                                wv.loadUrl(\"https://m.youtube.com/watch?v=$videoId&autoplay=1\")",
@@ -283,7 +294,7 @@ jobs:
                   "                                val qEnc = URLEncoder.encode(query, \"UTF-8\")",
                   "                                wv.loadUrl(\"https://m.youtube.com/results?search_query=$qEnc\")",
                   "                            }",
-                  "                            mainHandler.postDelayed(ytKeepAliveRunnable, 1500)",
+                  "                            mainHandler.postDelayed(ytKeepAliveRunnable, 1400)",
                   "                            result.success(mapOf(",
                   "                                \"success\" to true,",
                   "                                \"videoId\" to videoId,",
@@ -292,11 +303,18 @@ jobs:
                   "                        }",
                   "                    }",
                   "                }",
+                  "                \"duckYoutube\" -> {",
+                  "                    val duck = call.argument<Boolean>(\"duck\") ?: false",
+                  "                    ytTargetVolume = if (duck) 0.05 else 0.38",
+                  "                    ytWebView?.evaluateJavascript(\"try{var v=document.querySelector('video');if(v){v.volume=$ytTargetVolume;}}catch(e){}\", null)",
+                  "                    result.success(true)",
+                  "                }",
                   "                \"stopYoutube\" -> {",
                   "                    ytIsPlaying = false",
                   "                    mainHandler.removeCallbacks(ytKeepAliveRunnable)",
                   "                    ytWebView?.evaluateJavascript(\"try{var v=document.querySelector('video');if(v)v.pause();}catch(e){}\", null)",
                   "                    ytWebView?.loadUrl(\"about:blank\")",
+                  "                    releaseAudioFocusForMic()",
                   "                    result.success(true)",
                   "                }",
                   "                else -> result.notImplemented()",
@@ -405,6 +423,6 @@ jobs:
         with:
           tag_name: latest-build
           name: "XiaoZhi AI Pet - Pure XiaoZhi Edition"
-          body: "Download langsung file **xiaozhi-ai-pet.apk** di bawah ini (100% Opus XiaoZhi Audio + Wake Word + YouTube Music DJ/Guitar/Piano/Vocal + Physical Touch)."
+          body: "Download langsung file **xiaozhi-ai-pet.apk** di bawah ini."
           files: xiaozhi-ai-pet.apk
           prerelease: false
