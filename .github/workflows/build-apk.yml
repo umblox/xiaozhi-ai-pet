@@ -91,9 +91,29 @@ jobs:
           with open(gradle_path, "w") as f:
               f.write(g)
 
-          # 5. Tambal seluruh build.gradle plugin di ~/.pub-cache (termasuk flutter.ndkVersion & namespace)
+          # 5. Tambal seluruh build.gradle & record_linux.dart di ~/.pub-cache
           pub_cache = os.path.expanduser("~/.pub-cache")
           for root, dirs, files in os.walk(pub_cache):
+              # Patch record_linux.dart yang error karena ketidakcocokan versi record_platform_interface
+              if "record_linux.dart" in files:
+                  rl_path = os.path.join(root, "record_linux.dart")
+                  try:
+                      with open(rl_path, "r") as f:
+                          rl = f.read()
+                      rl = rl.replace(
+                          "class RecordLinux extends RecordPlatform {",
+                          "class RecordLinux extends RecordPlatform {\n  @override\n  dynamic noSuchMethod(Invocation i) => super.noSuchMethod(i);"
+                      )
+                      rl = rl.replace(
+                          "Future<bool> hasPermission(String recorderId)",
+                          "Future<bool> hasPermission(String recorderId, {bool request = true})"
+                      )
+                      with open(rl_path, "w") as f:
+                          f.write(rl)
+                      print(f"Patched Dart file: {rl_path}")
+                  except Exception as e:
+                      print(f"Skip {rl_path}: {e}")
+
               if "build.gradle" in files:
                   bg_path = os.path.join(root, "build.gradle")
                   try:
@@ -105,7 +125,6 @@ jobs:
                       bg = bg.replace("flutter.minSdkVersion", "23")
                       bg = bg.replace("flutter.ndkVersion", '"25.1.8937393"')
 
-                      # Auto-inject namespace jika ada plugin lama yang belum punya namespace
                       if "com.android.library" in bg and "namespace" not in bg:
                           manifest_cand = os.path.join(root, "src", "main", "AndroidManifest.xml")
                           if os.path.exists(manifest_cand):
