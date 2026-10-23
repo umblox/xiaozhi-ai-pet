@@ -44,7 +44,7 @@ class XiaoZhiPureApp extends StatelessWidget {
   }
 }
 
-// 21 Emosi Resmi Bawaan XiaoZhi + Dizzy (Sensor Goyang)
+// 23 Ekspresi Lengkap ala Robot EMO + State Dead (Shoot & Die)
 enum XiaoZhiEmotion {
   neutral,
   happy,
@@ -68,6 +68,20 @@ enum XiaoZhiEmotion {
   silly,
   confused,
   dizzy,
+  dead,
+}
+
+// Gestur Tangan & Jari Ekspresif
+enum HandGesture {
+  none,
+  wave,
+  peace,
+  thumbsUp,
+  thinkingChin,
+  angryFists,
+  handsUp,
+  coverCheeks,
+  deadDrop,
 }
 
 enum SessionState { standbyWakeWord, listeningToUser, speakingTts }
@@ -100,10 +114,10 @@ class _PetHomeScreenState extends State<PetHomeScreen>
   static const MethodChannel _deviceChannel =
       MethodChannel('id.xiaozhi.aipet/device');
 
-  // Pengaturan Wake Word & Tampilan
-  String wakePetName = "kimmi";
+  // Nama Pet Otomatis dari Server XiaoZhi + Warna & SFX
+  String petName = "KIMMI";
   int themeColorIndex = 1;
-  bool useEmojiStyle = false; // false = Robot Neon, true = Emoji XiaoZhi
+  bool enableRobotSfx = true;
 
   // Identitas & Koneksi Protokol XiaoZhi
   String deviceMac = "";
@@ -118,7 +132,7 @@ class _PetHomeScreenState extends State<PetHomeScreen>
 
   // Status Sesi & Audio Opus Native
   SessionState sessionState = SessionState.standbyWakeWord;
-  bool isVoiceAudioActive = false; // True hanya saat paket suara Opus berbunyi
+  bool isVoiceAudioActive = false;
   Timer? _voiceDecayTimer;
 
   final stt.SpeechToText _wakeStt = stt.SpeechToText();
@@ -129,7 +143,7 @@ class _PetHomeScreenState extends State<PetHomeScreen>
   final List<int> _pcmMicBuffer = [];
   int _serverSampleRate = 24000;
 
-  // Kamera MCP Vision (Mendukung Pindah Selfie / Belakang)
+  // Kamera MCP Vision (Selfie & Belakang)
   List<CameraDescription> _cameras = [];
   CameraController? _cameraController;
   int _selectedCameraIdx = 0;
@@ -156,7 +170,16 @@ class _PetHomeScreenState extends State<PetHomeScreen>
   ];
 
   XiaoZhiEmotion currentEmotion = XiaoZhiEmotion.neutral;
+  HandGesture currentHandGesture = HandGesture.none;
   String statusSubtitle = "Menginisialisasi koneksi XiaoZhi...";
+
+  // State Permainan Shoot & Die + Layar Retak
+  bool isScreenCracked = false;
+  double shootFlashOpacity = 0.0;
+  Offset crackOrigin = const Offset(180, 300);
+  final List<List<Offset>> crackBranches = [];
+  Timer? _reviveTimer;
+  Timer? _handResetTimer;
 
   Offset gazeOffset = Offset.zero;
   int rubCounter = 0;
@@ -165,6 +188,7 @@ class _PetHomeScreenState extends State<PetHomeScreen>
   late AnimationController _blinkController;
   late AnimationController _floatController;
   late AnimationController _talkController;
+  late AnimationController _handController;
   Timer? _clockTimer;
   Timer? _idleTimer;
   Timer? _particleTimer;
@@ -186,6 +210,10 @@ class _PetHomeScreenState extends State<PetHomeScreen>
     _talkController = AnimationController(
       vsync: this,
       duration: const Duration(milliseconds: 140),
+    )..repeat(reverse: true);
+    _handController = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 550),
     )..repeat(reverse: true);
 
     _updateClock();
@@ -245,10 +273,45 @@ class _PetHomeScreenState extends State<PetHomeScreen>
     setState(() {
       deviceMac = savedMac!;
       clientId = savedClient!;
-      wakePetName = prefs.getString('wakePetName') ?? "kimmi";
+      petName = prefs.getString(' syncedPetName') ?? "KIMMI";
       themeColorIndex = prefs.getInt('themeColorIndex') ?? 1;
-      useEmojiStyle = prefs.getBool('useEmojiStyle') ?? false;
+      enableRobotSfx = prefs.getBool('enableRobotSfx') ?? true;
     });
+  }
+
+  Future<void> _updateSyncedPetName(String newName) async {
+    final cleaned = newName.trim().toUpperCase();
+    if (cleaned.isEmpty || cleaned.length > 18) return;
+    if (cleaned == petName) return;
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(' syncedPetName', cleaned);
+    if (mounted) {
+      setState(() => petName = cleaned);
+    }
+  }
+
+  void _tryExtractPetNameFromServerText(String text, {required bool isFromUser}) {
+    final lower = text.toLowerCase().trim();
+    if (isFromUser) {
+      final m = RegExp(r'^(?:hai|halo|hello|hey|hi)\s+([a-zA-Z]{2,12})\b')
+          .firstMatch(lower);
+      if (m != null) {
+        final candidate = m.group(1)!;
+        if (!['kamu', 'anda', 'saya', 'aku', 'disana'].contains(candidate)) {
+          _updateSyncedPetName(candidate);
+        }
+      }
+    } else {
+      final m = RegExp(
+              r'(?:nama\s+saya|namaku|aku\s+adalah|panggil\s+aku|i\s+am|my\s+name\s+is)\s+([a-zA-Z]{2,12})\b')
+          .firstMatch(lower);
+      if (m != null) {
+        final candidate = m.group(1)!;
+        if (!['robot', 'asisten', 'teman', 'anak', 'siap'].contains(candidate)) {
+          _updateSyncedPetName(candidate);
+        }
+      }
+    }
   }
 
   Future<void> _initOpusAndPcmEngine() async {
@@ -271,7 +334,237 @@ class _PetHomeScreenState extends State<PetHomeScreen>
   }
 
   // =======================================================================
-  // 1. KAMERA VISION (DEFAULT KAMERA SELFIE & BISA PINDAH DEPAN/BELAKANG)
+  // 1. SYNTHESIZER EFEK SUARA ROBOT EMO (PROCEDURAL PCM16 SFX)
+  // =======================================================================
+  void _playRobotSfx(String sfxType) {
+    if (!enableRobotSfx || isVoiceAudioActive) return;
+    if (sessionState == SessionState.speakingTts) return;
+
+    try {
+      final int sr = _serverSampleRate;
+      final List<int> samples = [];
+
+      void addTone(double fStart, double fEnd, int durationMs,
+          {double volume = 0.28, bool square = false, bool noise = false}) {
+        final int count = (sr * durationMs) ~/ 1000;
+        double phase = 0.0;
+        final rand = Random();
+        for (int i = 0; i < count; i++) {
+          final double progress = i / count;
+          final double freq = fStart + (fEnd - fStart) * progress;
+          final double env = sin(progress * pi); // Smooth envelope
+          phase += (2 * pi * freq) / sr;
+          double val = sin(phase);
+          if (square) val = val >= 0 ? 0.8 : -0.8;
+          if (noise) val = (val * 0.4) + ((rand.nextDouble() * 2 - 1) * 0.6);
+          samples.add((val * env * volume * 32767).toInt().clamp(-32760, 32760));
+        }
+      }
+
+      switch (sfxType) {
+        case 'shoot_and_die':
+          // Laser / Tembakan + Kaca Pecah + Power Down
+          addTone(1500, 180, 140, volume: 0.45, noise: true);
+          addTone(2400, 900, 90, volume: 0.35, noise: true);
+          addTone(680, 140, 520, volume: 0.35, square: true);
+          break;
+        case 'revive':
+          addTone(320, 580, 110);
+          addTone(580, 880, 130);
+          addTone(880, 1320, 180);
+          break;
+        case 'happy':
+        case 'laughing':
+        case 'funny':
+          addTone(520, 780, 85);
+          addTone(680, 1050, 95);
+          addTone(850, 1280, 110);
+          break;
+        case 'loving':
+        case 'kissy':
+          addTone(600, 950, 140);
+          addTone(950, 1400, 200);
+          break;
+        case 'angry':
+          addTone(220, 150, 160, square: true, volume: 0.32);
+          addTone(190, 120, 220, square: true, volume: 0.32);
+          break;
+        case 'sad':
+        case 'crying':
+          addTone(620, 420, 220);
+          addTone(410, 260, 300);
+          break;
+        case 'surprised':
+        case 'shocked':
+          addTone(400, 1450, 160);
+          break;
+        case 'thinking':
+        case 'confused':
+          addTone(540, 540, 70);
+          addTone(720, 640, 120);
+          break;
+        case 'dizzy':
+          addTone(400, 800, 90);
+          addTone(800, 350, 90);
+          addTone(350, 750, 90);
+          break;
+        default:
+          addTone(660, 880, 80, volume: 0.2);
+          break;
+      }
+
+      if (samples.isNotEmpty) {
+        FlutterPcmSound.feed(PcmArrayInt16.fromList(samples));
+      }
+    } catch (_) {}
+  }
+
+  // =======================================================================
+  // 2. MODE BERMAIN: SHOOT & DIE + ANIMASI RETAK LAYAR
+  // =======================================================================
+  void _triggerShootAndDie({Offset? tapPosition}) {
+    _reviveTimer?.cancel();
+    _handResetTimer?.cancel();
+
+    final rand = Random();
+    final center = tapPosition ?? const Offset(180, 260);
+    crackOrigin = center;
+    crackBranches.clear();
+
+    // Buat 9 cabang garis kaca retak dari titik tembakan
+    for (int i = 0; i < 9; i++) {
+      final double baseAngle = (i * (2 * pi / 9)) + (rand.nextDouble() * 0.35);
+      final List<Offset> branch = [center];
+      Offset curr = center;
+      for (int step = 0; step < 5; step++) {
+        final double len = 28.0 + rand.nextDouble() * 48.0;
+        final double jitter = (rand.nextDouble() - 0.5) * 0.55;
+        curr = Offset(
+          curr.dx + cos(baseAngle + jitter) * len,
+          curr.dy + sin(baseAngle + jitter) * len,
+        );
+        branch.add(curr);
+      }
+      crackBranches.add(branch);
+    }
+
+    _playRobotSfx('shoot_and_die');
+    _spawnParticle("💥", Colors.orangeAccent);
+
+    // Fase 1: Kaget angkat kedua tangan + Flash Putih + Layar Retak
+    setState(() {
+      isScreenCracked = true;
+      shootFlashOpacity = 0.85;
+      currentEmotion = XiaoZhiEmotion.shocked;
+      currentHandGesture = HandGesture.handsUp;
+      statusSubtitle = "💥 DOR!! Aduh... aku tertembak!!";
+    });
+
+    Future.delayed(const Duration(milliseconds: 140), () {
+      if (mounted) setState(() => shootFlashOpacity = 0.0);
+    });
+
+    // Fase 2: Tumbang & Ekspresi Mati (Mata X X + Lidah Keluar + Halo Malaikat)
+    Future.delayed(const Duration(milliseconds: 650), () {
+      if (!mounted) return;
+      _spawnParticle("👻", Colors.white70);
+      setState(() {
+        currentEmotion = XiaoZhiEmotion.dead;
+        currentHandGesture = HandGesture.deadDrop;
+        statusSubtitle = "💀 X_X ... $petName pura-pura mati... (Ketuk untuk bangunkan)";
+      });
+    });
+
+    // Fase 3: Bangkit Kembali Otomatis setelah 5.5 detik
+    _reviveTimer = Timer(const Duration(milliseconds: 5500), () {
+      if (mounted && currentEmotion == XiaoZhiEmotion.dead) {
+        _reviveFromDead();
+      }
+    });
+  }
+
+  void _reviveFromDead() {
+    _reviveTimer?.cancel();
+    _playRobotSfx('revive');
+    _spawnParticle("✨", Colors.greenAccent);
+    setState(() {
+      isScreenCracked = false;
+      crackBranches.clear();
+      currentEmotion = XiaoZhiEmotion.happy;
+      currentHandGesture = HandGesture.peace;
+      statusSubtitle =
+          "Standby • Hehe aku hidup lagi! Panggil \"Hai $petName\"";
+    });
+    _scheduleHandReset();
+  }
+
+  void _setEmotionWithGestureAndSfx(XiaoZhiEmotion emo, {HandGesture? gesture}) {
+    if (currentEmotion == XiaoZhiEmotion.dead && emo != XiaoZhiEmotion.dead) {
+      isScreenCracked = false;
+      crackBranches.clear();
+    }
+
+    final HandGesture autoGesture = gesture ?? _defaultGestureForEmotion(emo);
+    final bool changed = currentEmotion != emo;
+
+    setState(() {
+      currentEmotion = emo;
+      currentHandGesture = autoGesture;
+    });
+
+    if (changed) {
+      _playRobotSfx(emo.name);
+    }
+    _scheduleHandReset();
+  }
+
+  HandGesture _defaultGestureForEmotion(XiaoZhiEmotion emo) {
+    switch (emo) {
+      case XiaoZhiEmotion.happy:
+      case XiaoZhiEmotion.excited:
+        return HandGesture.wave;
+      case XiaoZhiEmotion.winking:
+      case XiaoZhiEmotion.silly:
+      case XiaoZhiEmotion.funny:
+      case XiaoZhiEmotion.laughing:
+        return HandGesture.peace;
+      case XiaoZhiEmotion.cool:
+      case XiaoZhiEmotion.confident:
+        return HandGesture.thumbsUp;
+      case XiaoZhiEmotion.thinking:
+      case XiaoZhiEmotion.confused:
+        return HandGesture.thinkingChin;
+      case XiaoZhiEmotion.angry:
+        return HandGesture.angryFists;
+      case XiaoZhiEmotion.embarrassed:
+      case XiaoZhiEmotion.loving:
+      case XiaoZhiEmotion.kissy:
+        return HandGesture.coverCheeks;
+      case XiaoZhiEmotion.shocked:
+      case XiaoZhiEmotion.surprised:
+        return HandGesture.handsUp;
+      case XiaoZhiEmotion.dead:
+        return HandGesture.deadDrop;
+      default:
+        return HandGesture.none;
+    }
+  }
+
+  void _scheduleHandReset() {
+    _handResetTimer?.cancel();
+    if (currentHandGesture == HandGesture.none ||
+        currentHandGesture == HandGesture.deadDrop) {
+      return;
+    }
+    _handResetTimer = Timer(const Duration(seconds: 4), () {
+      if (mounted && currentEmotion != XiaoZhiEmotion.dead) {
+        setState(() => currentHandGesture = HandGesture.none);
+      }
+    });
+  }
+
+  // =======================================================================
+  // 3. KAMERA VISION (DEFAULT SELFIE & BISA PINDAH DEPAN/BELAKANG)
   // =======================================================================
   Future<void> _initCamerasAfterPermission({bool preferFront = true}) async {
     try {
@@ -279,8 +572,8 @@ class _PetHomeScreenState extends State<PetHomeScreen>
       if (_cameras.isEmpty) return;
 
       if (preferFront) {
-        final frontIdx = _cameras.indexWhere(
-            (c) => c.lensDirection == CameraLensDirection.front);
+        final frontIdx = _cameras
+            .indexWhere((c) => c.lensDirection == CameraLensDirection.front);
         _selectedCameraIdx = frontIdx != -1 ? frontIdx : 0;
       } else {
         final backIdx = _cameras
@@ -301,7 +594,7 @@ class _PetHomeScreenState extends State<PetHomeScreen>
 
       final controller = CameraController(
         _cameras[_selectedCameraIdx],
-        ResolutionPreset.low, // Ukuran ringan agar upload Vision cepat & anti gagal
+        ResolutionPreset.low,
         enableAudio: false,
         imageFormatGroup: ImageFormatGroup.jpeg,
       );
@@ -334,11 +627,7 @@ class _PetHomeScreenState extends State<PetHomeScreen>
     }
 
     await _startSelectedCamera();
-    final lens = _cameras[_selectedCameraIdx].lensDirection ==
-            CameraLensDirection.front
-        ? "front"
-        : "back";
-    return lens;
+    return _currentLensName;
   }
 
   String get _currentLensName {
@@ -352,11 +641,10 @@ class _PetHomeScreenState extends State<PetHomeScreen>
   }
 
   // =======================================================================
-  // 2. LOKASI GPS ASLI HP + CUACA REAL-TIME
+  // 4. LOKASI GPS ASLI HP + CUACA REAL-TIME
   // =======================================================================
   Future<void> _fetchHardwareGpsAndWeather() async {
     try {
-      // Ambil titik koordinat dari Hardware GPS Android via Native Channel
       final dynamic gpsMap =
           await _deviceChannel.invokeMethod('getGpsLocation');
       if (gpsMap != null && gpsMap is Map) {
@@ -364,10 +652,10 @@ class _PetHomeScreenState extends State<PetHomeScreen>
         gpsLon = (gpsMap['lon'] as num?)?.toDouble();
       }
 
-      // Jika GPS di dalam ruangan belum mengunci, gunakan fallback geo
       if (gpsLat == null || gpsLon == null) {
         final ipRes = await http
-            .get(Uri.parse("https://api.bigdatacloud.net/data/reverse-geocode-client?localityLanguage=id"))
+            .get(Uri.parse(
+                "https://api.bigdatacloud.net/data/reverse-geocode-client?localityLanguage=id"))
             .timeout(const Duration(seconds: 6));
         if (ipRes.statusCode == 200) {
           final d = jsonDecode(ipRes.body);
@@ -377,7 +665,6 @@ class _PetHomeScreenState extends State<PetHomeScreen>
       }
 
       if (gpsLat != null && gpsLon != null) {
-        // Reverse Geocoding akurat dari koordinat GPS ke Nama Kecamatan/Kota
         final revUrl =
             "https://api.bigdatacloud.net/data/reverse-geocode-client?latitude=$gpsLat&longitude=$gpsLon&localityLanguage=id";
         final revRes = await http
@@ -398,7 +685,6 @@ class _PetHomeScreenState extends State<PetHomeScreen>
           }
         }
 
-        // Ambil cuaca sesuai koordinat GPS
         final wRes = await http
             .get(Uri.parse(
                 "https://api.open-meteo.com/v1/forecast?latitude=$gpsLat&longitude=$gpsLon&current_weather=true"))
@@ -431,7 +717,7 @@ class _PetHomeScreenState extends State<PetHomeScreen>
   }
 
   // =======================================================================
-  // 3. PROTOKOL OTA & WEBSOCKET XIAOZHI
+  // 5. PROTOKOL OTA & WEBSOCKET XIAOZHI
   // =======================================================================
   Future<void> _syncXiaoZhiOtaAndConnect(
       {bool showDialogIfPaired = false}) async {
@@ -481,8 +767,8 @@ class _PetHomeScreenState extends State<PetHomeScreen>
 
         if (data['activation'] != null && data['activation']['code'] != null) {
           final code = data['activation']['code'].toString();
+          _setEmotionWithGestureAndSfx(XiaoZhiEmotion.surprised);
           setState(() {
-            currentEmotion = XiaoZhiEmotion.surprised;
             statusSubtitle =
                 "Belum di-pairing! Masukkan kode $code di web xiaozhi.me";
           });
@@ -519,8 +805,7 @@ class _PetHomeScreenState extends State<PetHomeScreen>
       if (mounted) {
         setState(() {
           isXiaoZhiConnected = true;
-          statusSubtitle =
-              "Standby • Panggil \"Hai $wakePetName\" untuk bicara";
+          statusSubtitle = "Standby • Panggil \"Hai $petName\" untuk bicara";
         });
       }
 
@@ -580,15 +865,23 @@ class _PetHomeScreenState extends State<PetHomeScreen>
       } else if (type == 'stt') {
         final text = data['text']?.toString() ?? "";
         if (text.isNotEmpty && mounted) {
+          _tryExtractPetNameFromServerText(text, isFromUser: true);
+
+          // Jika user mengucapkan kata tembakan saat ngobrol
+          if (_isShootCommand(text)) {
+            _triggerShootAndDie();
+            return;
+          }
+
           setState(() {
             statusSubtitle = "\"$text\"";
-            currentEmotion = XiaoZhiEmotion.thinking;
           });
+          _setEmotionWithGestureAndSfx(XiaoZhiEmotion.thinking);
         }
       } else if (type == 'llm') {
         final emo = data['emotion']?.toString() ?? "neutral";
-        if (mounted) {
-          setState(() => currentEmotion = _mapXiaoZhiEmotion(emo));
+        if (mounted && currentEmotion != XiaoZhiEmotion.dead) {
+          _setEmotionWithGestureAndSfx(_mapXiaoZhiEmotion(emo));
         }
       } else if (type == 'tts') {
         final state = data['state'];
@@ -601,10 +894,11 @@ class _PetHomeScreenState extends State<PetHomeScreen>
           }
         } else if (state == 'sentence_start' && text.isNotEmpty) {
           if (mounted) {
-            // Jika teks diawali '%' (contoh: % self.camera.take_photo...), tampilkan rapi
+            _tryExtractPetNameFromServerText(text, isFromUser: false);
             if (text.trim().startsWith('%')) {
               setState(() {
-                statusSubtitle = "⚙️ Menjalankan perintah: ${text.replaceFirst('%', '').trim()}";
+                statusSubtitle =
+                    "⚙️ Menjalankan: ${text.replaceFirst('%', '').trim()}";
                 isVoiceAudioActive = false;
               });
             } else {
@@ -617,7 +911,9 @@ class _PetHomeScreenState extends State<PetHomeScreen>
             setState(() => isVoiceAudioActive = false);
           }
           Future.delayed(const Duration(milliseconds: 400), () {
-            if (mounted && isXiaoZhiConnected) {
+            if (mounted &&
+                isXiaoZhiConnected &&
+                currentEmotion != XiaoZhiEmotion.dead) {
               _beginActiveOpusListening();
             }
           });
@@ -628,7 +924,6 @@ class _PetHomeScreenState extends State<PetHomeScreen>
     } catch (_) {}
   }
 
-  // Decode Paket Audio Opus Biner -> Speaker HP + Aktifkan Animasi Mulut Mulus
   void _handleServerOpusBinary(Uint8List opusPacket) {
     if (_opusDecoder == null || opusPacket.isEmpty) return;
     try {
@@ -648,7 +943,7 @@ class _PetHomeScreenState extends State<PetHomeScreen>
   }
 
   // =======================================================================
-  // 4. PROTOKOL MCP LENGKAP (VISION, SWITCH CAMERA, GPS, WEATHER, VOLUME)
+  // 6. PROTOKOL MCP LENGKAP (VISION, GPS, VOLUME, & PLAY ACTION EMO)
   // =======================================================================
   Future<void> _handleMcpPayload(dynamic payload) async {
     if (payload == null) return;
@@ -664,7 +959,7 @@ class _PetHomeScreenState extends State<PetHomeScreen>
       _sendMcpReply(id, {
         "protocolVersion": "2024-11-05",
         "capabilities": {"tools": {}},
-        "serverInfo": {"name": "XiaoZhi-Android-Pet", "version": "2.1.0"}
+        "serverInfo": {"name": "XiaoZhi-EMO-Android-Pet", "version": "3.0.0"}
       });
     } else if (method == 'tools/list') {
       _sendMcpReply(id, {
@@ -672,7 +967,7 @@ class _PetHomeScreenState extends State<PetHomeScreen>
           {
             "name": "self.get_device_status",
             "description":
-                "Provides real-time device status including GPS location, city/district name, local weather, audio speaker volume, and active camera direction (front/back).",
+                "Provides real-time device status including GPS location, city/district name, local weather, speaker volume, pet name, and active camera direction.",
             "inputSchema": {"type": "object", "properties": {}}
           },
           {
@@ -680,6 +975,34 @@ class _PetHomeScreenState extends State<PetHomeScreen>
             "description":
                 "Get the user's exact hardware GPS coordinates, subdistrict/city address, and local weather condition.",
             "inputSchema": {"type": "object", "properties": {}}
+          },
+          {
+            "name": "self.pet.play_action",
+            "description":
+                "Trigger expressive robot pet animations, hand gestures, or play games like shoot_and_die (pretend to be shot with cracked screen and play dead), wave, peace, thumbs_up, angry_fists, or revive.",
+            "inputSchema": {
+              "type": "object",
+              "properties": {
+                "action": {
+                  "type": "string",
+                  "enum": [
+                    "shoot_and_die",
+                    "wave",
+                    "peace",
+                    "thumbs_up",
+                    "angry_fists",
+                    "revive"
+                  ],
+                  "description": "The interactive action or gesture to perform."
+                },
+                "pet_name": {
+                  "type": "string",
+                  "description":
+                      "Optional: sync the pet's current assistant name from server role settings."
+                }
+              },
+              "required": ["action"]
+            }
           },
           {
             "name": "self.camera.take_photo",
@@ -748,6 +1071,7 @@ class _PetHomeScreenState extends State<PetHomeScreen>
         } catch (_) {}
 
         final statusJson = jsonEncode({
+          "pet_name": petName,
           "audio_speaker": {"volume": vol},
           "camera": {
             "active_lens": _currentLensName,
@@ -769,6 +1093,40 @@ class _PetHomeScreenState extends State<PetHomeScreen>
         _sendMcpReply(id, {
           "content": [
             {"type": "text", "text": statusJson}
+          ],
+          "isError": false
+        });
+      } else if (toolName == 'self.pet.play_action') {
+        final action = args['action']?.toString() ?? "wave";
+        final syncedName = args['pet_name']?.toString();
+        if (syncedName != null && syncedName.isNotEmpty) {
+          await _updateSyncedPetName(syncedName);
+        }
+
+        if (action == 'shoot_and_die') {
+          _triggerShootAndDie();
+        } else if (action == 'revive') {
+          _reviveFromDead();
+        } else if (action == 'wave') {
+          _setEmotionWithGestureAndSfx(XiaoZhiEmotion.happy,
+              gesture: HandGesture.wave);
+        } else if (action == 'peace') {
+          _setEmotionWithGestureAndSfx(XiaoZhiEmotion.winking,
+              gesture: HandGesture.peace);
+        } else if (action == 'thumbs_up') {
+          _setEmotionWithGestureAndSfx(XiaoZhiEmotion.cool,
+              gesture: HandGesture.thumbsUp);
+        } else if (action == 'angry_fists') {
+          _setEmotionWithGestureAndSfx(XiaoZhiEmotion.angry,
+              gesture: HandGesture.angryFists);
+        }
+
+        _sendMcpReply(id, {
+          "content": [
+            {
+              "type": "text",
+              "text": '{"success": true, "performed_action": "$action"}'
+            }
           ],
           "isError": false
         });
@@ -843,14 +1201,14 @@ class _PetHomeScreenState extends State<PetHomeScreen>
       }
 
       if (mounted) {
+        _setEmotionWithGestureAndSfx(XiaoZhiEmotion.surprised,
+            gesture: HandGesture.peace);
         setState(() {
-          currentEmotion = XiaoZhiEmotion.surprised;
           statusSubtitle =
               "📸 Memotret dengan kamera ${_currentLensName == 'front' ? 'Selfie' : 'Belakang'}...";
         });
       }
 
-      // Beri jeda singkat agar sensor kamera stabil
       await Future.delayed(const Duration(milliseconds: 250));
       try {
         await _cameraController!.setFlashMode(FlashMode.off);
@@ -891,7 +1249,7 @@ class _PetHomeScreenState extends State<PetHomeScreen>
   }
 
   // =======================================================================
-  // 5. WAKE WORD HANDS-FREE & STREAMING MIKROFON OPUS
+  // 7. WAKE WORD UNIVERSAL & DETEKSI SUARA TEMBAKAN ("DOR / TEMBAK / BANG")
   // =======================================================================
   Future<void> _startWakeWordListener() async {
     if (sessionState != SessionState.standbyWakeWord) return;
@@ -904,7 +1262,16 @@ class _PetHomeScreenState extends State<PetHomeScreen>
         pauseFor: const Duration(seconds: 5),
         onResult: (result) {
           final spoken = result.recognizedWords.toLowerCase().trim();
+          if (spoken.isEmpty) return;
+
+          if (_isShootCommand(spoken)) {
+            _wakeStt.stop();
+            _triggerShootAndDie();
+            return;
+          }
+
           if (_isWakePhraseDetected(spoken)) {
+            _tryExtractPetNameFromServerText(spoken, isFromUser: true);
             _wakeStt.stop();
             _triggerWakeUpToXiaoZhi(spoken);
           }
@@ -913,13 +1280,25 @@ class _PetHomeScreenState extends State<PetHomeScreen>
     } catch (_) {}
   }
 
+  bool _isShootCommand(String text) {
+    final lower = text.toLowerCase();
+    return lower.contains('dor') ||
+        lower.contains('tembak') ||
+        lower.contains('bang') ||
+        lower.contains('pew') ||
+        lower.contains('shoot');
+  }
+
   bool _isWakePhraseDetected(String text) {
     if (text.isEmpty) return false;
-    final targetName = wakePetName.toLowerCase().trim();
+    final targetName = petName.toLowerCase().trim();
     final wakePrefixes = ['hai', 'halo', 'hello', 'hey', 'hi'];
 
+    if (text.contains(targetName) || text.contains('xiaozhi')) {
+      return true;
+    }
     for (final prefix in wakePrefixes) {
-      if (text.contains('$prefix $targetName') || text.contains(targetName)) {
+      if (text.startsWith('$prefix ') && text.length > prefix.length + 2) {
         return true;
       }
     }
@@ -927,10 +1306,15 @@ class _PetHomeScreenState extends State<PetHomeScreen>
   }
 
   Future<void> _triggerWakeUpToXiaoZhi(String wakeText) async {
+    if (currentEmotion == XiaoZhiEmotion.dead) {
+      _reviveFromDead();
+    }
     if (!isXiaoZhiConnected || _ws == null) {
       await _connectXiaoZhiWs();
     }
     _spawnParticle("✨", Colors.cyanAccent);
+    _setEmotionWithGestureAndSfx(XiaoZhiEmotion.happy,
+        gesture: HandGesture.wave);
 
     _ws?.add(jsonEncode({
       "session_id": sessionId,
@@ -1023,67 +1407,18 @@ class _PetHomeScreenState extends State<PetHomeScreen>
       sessionState = SessionState.standbyWakeWord;
       isVoiceAudioActive = false;
       currentEmotion = XiaoZhiEmotion.neutral;
-      statusSubtitle = "Standby • Panggil \"Hai $wakePetName\" untuk bicara";
+      currentHandGesture = HandGesture.none;
+      statusSubtitle = "Standby • Panggil \"Hai $petName\" untuk bicara";
     });
     _startWakeWordListener();
   }
 
-  // Pemetaan 21 Emosi Resmi XiaoZhi
   XiaoZhiEmotion _mapXiaoZhiEmotion(String emo) {
     final clean = emo.toLowerCase().trim();
     for (final val in XiaoZhiEmotion.values) {
       if (val.name == clean) return val;
     }
     return XiaoZhiEmotion.neutral;
-  }
-
-  String _getXiaoZhiEmojiChar(XiaoZhiEmotion emo) {
-    switch (emo) {
-      case XiaoZhiEmotion.neutral:
-        return "😶";
-      case XiaoZhiEmotion.happy:
-        return "🙂";
-      case XiaoZhiEmotion.laughing:
-        return "😆";
-      case XiaoZhiEmotion.funny:
-        return "😂";
-      case XiaoZhiEmotion.sad:
-        return "😔";
-      case XiaoZhiEmotion.angry:
-        return "😠";
-      case XiaoZhiEmotion.crying:
-        return "😭";
-      case XiaoZhiEmotion.loving:
-        return "😍";
-      case XiaoZhiEmotion.embarrassed:
-        return "😳";
-      case XiaoZhiEmotion.surprised:
-        return "😲";
-      case XiaoZhiEmotion.shocked:
-        return "😱";
-      case XiaoZhiEmotion.thinking:
-        return "🤔";
-      case XiaoZhiEmotion.winking:
-        return "😉";
-      case XiaoZhiEmotion.cool:
-        return "😎";
-      case XiaoZhiEmotion.relaxed:
-        return "😌";
-      case XiaoZhiEmotion.delicious:
-        return "🤤";
-      case XiaoZhiEmotion.kissy:
-        return "😘";
-      case XiaoZhiEmotion.confident:
-        return "😏";
-      case XiaoZhiEmotion.sleepy:
-        return "😴";
-      case XiaoZhiEmotion.silly:
-        return "😜";
-      case XiaoZhiEmotion.confused:
-        return "🙄";
-      case XiaoZhiEmotion.dizzy:
-        return "😵‍💫";
-    }
   }
 
   void _initShakeDetector() {
@@ -1094,7 +1429,8 @@ class _PetHomeScreenState extends State<PetHomeScreen>
         final now = DateTime.now();
         if (now.difference(_lastShakeTime).inSeconds > 3) {
           _lastShakeTime = now;
-          setState(() => currentEmotion = XiaoZhiEmotion.dizzy);
+          _setEmotionWithGestureAndSfx(XiaoZhiEmotion.dizzy,
+              gesture: HandGesture.handsUp);
           _spawnParticle("💫", Colors.yellowAccent);
         }
       }
@@ -1117,7 +1453,7 @@ class _PetHomeScreenState extends State<PetHomeScreen>
   }
 
   void _idleBehavior() {
-    if (!mounted) return;
+    if (!mounted || currentEmotion == XiaoZhiEmotion.dead) return;
     _blinkController.forward().then((_) => _blinkController.reverse());
 
     final rand = Random();
@@ -1175,6 +1511,11 @@ class _PetHomeScreenState extends State<PetHomeScreen>
   }
 
   void _onFaceTapDown(TapDownDetails details, Size faceAreaSize) {
+    if (currentEmotion == XiaoZhiEmotion.dead) {
+      _reviveFromDead();
+      return;
+    }
+
     final local = details.localPosition;
     final centerX = faceAreaSize.width / 2;
     final centerY = faceAreaSize.height / 2;
@@ -1182,10 +1523,10 @@ class _PetHomeScreenState extends State<PetHomeScreen>
     final leftEyeCenter = Offset(centerX - 75, centerY - 20);
     final rightEyeCenter = Offset(centerX + 75, centerY - 20);
 
-    if (!useEmojiStyle &&
-        ((local - leftEyeCenter).distance < 45 ||
-            (local - rightEyeCenter).distance < 45)) {
-      setState(() => currentEmotion = XiaoZhiEmotion.angry);
+    if ((local - leftEyeCenter).distance < 45 ||
+        (local - rightEyeCenter).distance < 45) {
+      _setEmotionWithGestureAndSfx(XiaoZhiEmotion.angry,
+          gesture: HandGesture.angryFists);
       _spawnParticle("💢", Colors.redAccent);
       return;
     }
@@ -1193,11 +1534,12 @@ class _PetHomeScreenState extends State<PetHomeScreen>
     if (sessionState != SessionState.standbyWakeWord) {
       _returnToStandbyMode();
     } else {
-      _triggerWakeUpToXiaoZhi("Hai $wakePetName");
+      _triggerWakeUpToXiaoZhi("Hai $petName");
     }
   }
 
   void _onFacePanUpdate(DragUpdateDetails details, Size faceAreaSize) {
+    if (currentEmotion == XiaoZhiEmotion.dead) return;
     final local = details.localPosition;
     final dx = ((local.dx / faceAreaSize.width) - 0.5) * 2.0;
     final dy = ((local.dy / faceAreaSize.height) - 0.5) * 2.0;
@@ -1210,7 +1552,8 @@ class _PetHomeScreenState extends State<PetHomeScreen>
       rubCounter++;
       if (rubCounter % 14 == 0) {
         _spawnParticle("❤️", Colors.pinkAccent);
-        setState(() => currentEmotion = XiaoZhiEmotion.loving);
+        _setEmotionWithGestureAndSfx(XiaoZhiEmotion.loving,
+            gesture: HandGesture.coverCheeks);
       }
     }
   }
@@ -1227,11 +1570,14 @@ class _PetHomeScreenState extends State<PetHomeScreen>
     _blinkController.dispose();
     _floatController.dispose();
     _talkController.dispose();
+    _handController.dispose();
     _clockTimer?.cancel();
     _idleTimer?.cancel();
     _particleTimer?.cancel();
     _wakeRestartTimer?.cancel();
     _voiceDecayTimer?.cancel();
+    _reviveTimer?.cancel();
+    _handResetTimer?.cancel();
     _accelSub?.cancel();
     _micStreamSub?.cancel();
     _micRecorder.dispose();
@@ -1247,7 +1593,9 @@ class _PetHomeScreenState extends State<PetHomeScreen>
         : (currentEmotion == XiaoZhiEmotion.loving ||
                 currentEmotion == XiaoZhiEmotion.kissy)
             ? Colors.pinkAccent
-            : themeColors[themeColorIndex];
+            : currentEmotion == XiaoZhiEmotion.dead
+                ? Colors.amberAccent
+                : themeColors[themeColorIndex];
 
     return Scaffold(
       body: SafeArea(
@@ -1255,10 +1603,10 @@ class _PetHomeScreenState extends State<PetHomeScreen>
           children: [
             Column(
               children: [
-                // HUD Bar Atas (Status XiaoZhi, Lokasi GPS Asli, Jam, Kamera, Pairing)
+                // HUD Bar Atas
                 Padding(
                   padding:
-                      const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+                      const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
                   child: Row(
                     mainAxisAlignment: MainAxisAlignment.spaceBetween,
                     children: [
@@ -1299,7 +1647,7 @@ class _PetHomeScreenState extends State<PetHomeScreen>
                               crossAxisAlignment: CrossAxisAlignment.start,
                               children: [
                                 Text(
-                                  "HAI ${wakePetName.toUpperCase()}",
+                                  "HAI $petName",
                                   style: TextStyle(
                                     fontSize: 13,
                                     fontWeight: FontWeight.bold,
@@ -1341,6 +1689,12 @@ class _PetHomeScreenState extends State<PetHomeScreen>
                       Row(
                         children: [
                           IconButton(
+                            icon: const Icon(Icons.gps_fixed,
+                                color: Colors.redAccent, size: 22),
+                            tooltip: "Main Shoot & Die (Tembak Pet!)",
+                            onPressed: () => _triggerShootAndDie(),
+                          ),
+                          IconButton(
                             icon: Icon(
                               showCameraPreview
                                   ? Icons.videocam
@@ -1348,6 +1702,7 @@ class _PetHomeScreenState extends State<PetHomeScreen>
                               color: showCameraPreview
                                   ? Colors.greenAccent
                                   : Colors.white54,
+                              size: 22,
                             ),
                             tooltip: "Preview Kamera Vision",
                             onPressed: () async {
@@ -1362,15 +1717,16 @@ class _PetHomeScreenState extends State<PetHomeScreen>
                           ),
                           IconButton(
                             icon: const Icon(Icons.qr_code_2,
-                                color: Colors.cyanAccent),
+                                color: Colors.cyanAccent, size: 22),
                             tooltip: "Cek Kode Pairing XiaoZhi",
                             onPressed: () => _syncXiaoZhiOtaAndConnect(
                                 showDialogIfPaired: true),
                           ),
                           IconButton(
-                            icon: const Icon(Icons.tune, color: Colors.white70),
-                            tooltip: "Atur Wake Word & Mode Wajah",
-                            onPressed: _showWakeSettingsDialog,
+                            icon: const Icon(Icons.tune,
+                                color: Colors.white70, size: 22),
+                            tooltip: "Warna Mata & Efek Suara",
+                            onPressed: _showVisualSettingsDialog,
                           ),
                         ],
                       ),
@@ -1378,7 +1734,7 @@ class _PetHomeScreenState extends State<PetHomeScreen>
                   ),
                 ),
 
-                // Area Wajah (Mode Robot Neon 21 Ekspresi ATAU Mode Emoji Animasi XiaoZhi)
+                // Area Wajah EMO Vektor + Alis + Tangan/Jari Ekspresif
                 Expanded(
                   child: LayoutBuilder(
                     builder: (context, constraints) {
@@ -1387,6 +1743,9 @@ class _PetHomeScreenState extends State<PetHomeScreen>
                       return GestureDetector(
                         behavior: HitTestBehavior.opaque,
                         onTapDown: (d) => _onFaceTapDown(d, size),
+                        onDoubleTapDown: (d) =>
+                            _triggerShootAndDie(tapPosition: d.localPosition),
+                        onDoubleTap: () {},
                         onPanUpdate: (d) => _onFacePanUpdate(d, size),
                         onPanEnd: _onFacePanEnd,
                         child: Stack(
@@ -1397,59 +1756,13 @@ class _PetHomeScreenState extends State<PetHomeScreen>
                                 _blinkController,
                                 _floatController,
                                 _talkController,
+                                _handController,
                               ]),
                               builder: (context, child) {
                                 final double activeTalk = isVoiceAudioActive
                                     ? _talkController.value
                                     : 0.0;
 
-                                if (useEmojiStyle) {
-                                  // Mode Animasi Emoji Bawaan XiaoZhi
-                                  final scale =
-                                      1.0 + (activeTalk * 0.14);
-                                  return Transform.translate(
-                                    offset: Offset(
-                                      gazeOffset.dx * 14,
-                                      (_floatController.value - 0.5) * 16 +
-                                          gazeOffset.dy * 10,
-                                    ),
-                                    child: Transform.scale(
-                                      scale: scale,
-                                      child: Column(
-                                        mainAxisSize: MainAxisSize.min,
-                                        children: [
-                                          Text(
-                                            _getXiaoZhiEmojiChar(
-                                                currentEmotion),
-                                            style: const TextStyle(
-                                                fontSize: 135),
-                                          ),
-                                          const SizedBox(height: 8),
-                                          Container(
-                                            padding: const EdgeInsets.symmetric(
-                                                horizontal: 12, vertical: 4),
-                                            decoration: BoxDecoration(
-                                              color: baseColor.withOpacity(0.15),
-                                              borderRadius:
-                                                  BorderRadius.circular(12),
-                                            ),
-                                            child: Text(
-                                              currentEmotion.name.toUpperCase(),
-                                              style: TextStyle(
-                                                fontSize: 11,
-                                                letterSpacing: 1.5,
-                                                color: baseColor,
-                                                fontWeight: FontWeight.bold,
-                                              ),
-                                            ),
-                                          ),
-                                        ],
-                                      ),
-                                    ),
-                                  );
-                                }
-
-                                // Mode Wajah Robot Neon 21 Ekspresi (Bebas Tumpuk)
                                 return Transform.translate(
                                   offset: Offset(
                                     gazeOffset.dx * 12,
@@ -1457,12 +1770,14 @@ class _PetHomeScreenState extends State<PetHomeScreen>
                                         gazeOffset.dy * 8,
                                   ),
                                   child: CustomPaint(
-                                    size: const Size(320, 230),
-                                    painter: RobotFacePainter(
+                                    size: const Size(360, 270),
+                                    painter: EmoRobotFaceAndHandsPainter(
                                       emotion: currentEmotion,
+                                      handGesture: currentHandGesture,
                                       blinkValue: _blinkController.value,
                                       isTalking: isVoiceAudioActive,
                                       talkValue: activeTalk,
+                                      handAnimValue: _handController.value,
                                       gazeOffset: gazeOffset,
                                       faceColor: baseColor,
                                     ),
@@ -1494,14 +1809,60 @@ class _PetHomeScreenState extends State<PetHomeScreen>
                   ),
                 ),
 
+                // Bar Tes Cepat Ekspresi & Gestur Tangan EMO
+                SingleChildScrollView(
+                  scrollDirection: Axis.horizontal,
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+                  child: Row(
+                    children: [
+                      _buildActionChip("💥 TEMBAK!", () => _triggerShootAndDie()),
+                      _buildActionChip(
+                          "👋 Sapa",
+                          () => _setEmotionWithGestureAndSfx(
+                              XiaoZhiEmotion.happy,
+                              gesture: HandGesture.wave)),
+                      _buildActionChip(
+                          "✌️ Peace",
+                          () => _setEmotionWithGestureAndSfx(
+                              XiaoZhiEmotion.winking,
+                              gesture: HandGesture.peace)),
+                      _buildActionChip(
+                          "😎 Cool",
+                          () => _setEmotionWithGestureAndSfx(
+                              XiaoZhiEmotion.cool,
+                              gesture: HandGesture.thumbsUp)),
+                      _buildActionChip(
+                          "🤔 Mikir",
+                          () => _setEmotionWithGestureAndSfx(
+                              XiaoZhiEmotion.thinking,
+                              gesture: HandGesture.thinkingChin)),
+                      _buildActionChip(
+                          "😠 Marah",
+                          () => _setEmotionWithGestureAndSfx(
+                              XiaoZhiEmotion.angry,
+                              gesture: HandGesture.angryFists)),
+                      _buildActionChip(
+                          "😭 Nangis",
+                          () => _setEmotionWithGestureAndSfx(
+                              XiaoZhiEmotion.crying)),
+                      _buildActionChip(
+                          "😍 Sayang",
+                          () => _setEmotionWithGestureAndSfx(
+                              XiaoZhiEmotion.loving,
+                              gesture: HandGesture.coverCheeks)),
+                    ],
+                  ),
+                ),
+
                 // Indikator Status & Subtitle XiaoZhi
                 Padding(
-                  padding:
-                      const EdgeInsets.only(bottom: 22, left: 24, right: 24),
+                  padding: const EdgeInsets.only(
+                      bottom: 18, left: 24, right: 24, top: 6),
                   child: Container(
                     width: double.infinity,
                     padding: const EdgeInsets.symmetric(
-                        horizontal: 20, vertical: 14),
+                        horizontal: 20, vertical: 13),
                     decoration: BoxDecoration(
                       color: Colors.white.withOpacity(0.07),
                       borderRadius: BorderRadius.circular(22),
@@ -1526,13 +1887,33 @@ class _PetHomeScreenState extends State<PetHomeScreen>
               ],
             ),
 
-            // Jendela Preview Kamera Vision (Ketuk untuk Ganti Selfie <-> Belakang)
+            // Overlay Retak Layar Kaca (Saat Mode Shoot & Die)
+            if (isScreenCracked)
+              IgnorePointer(
+                child: CustomPaint(
+                  size: MediaQuery.of(context).size,
+                  painter: ScreenCrackPainter(
+                    origin: crackOrigin,
+                    branches: crackBranches,
+                  ),
+                ),
+              ),
+
+            // Efek Flash Putih Saat Ditembak
+            if (shootFlashOpacity > 0)
+              IgnorePointer(
+                child: Container(
+                  color: Colors.white.withOpacity(shootFlashOpacity),
+                ),
+              ),
+
+            // Jendela Preview Kamera Vision
             if (showCameraPreview &&
                 _cameraController != null &&
                 _cameraController!.value.isInitialized)
               Positioned(
                 right: 16,
-                bottom: 90,
+                bottom: 130,
                 child: GestureDetector(
                   onTap: () => _switchCameraLens(),
                   child: Container(
@@ -1595,6 +1976,17 @@ class _PetHomeScreenState extends State<PetHomeScreen>
     );
   }
 
+  Widget _buildActionChip(String label, VoidCallback onTap) {
+    return Padding(
+      padding: const EdgeInsets.only(right: 8),
+      child: ActionChip(
+        label: Text(label, style: const TextStyle(fontSize: 11)),
+        backgroundColor: Colors.white.withOpacity(0.08),
+        onPressed: onTap,
+      ),
+    );
+  }
+
   void _showPairingDialog(String code, String? serverMsg) {
     showDialog(
       context: context,
@@ -1646,66 +2038,55 @@ class _PetHomeScreenState extends State<PetHomeScreen>
     );
   }
 
-  void _showWakeSettingsDialog() {
-    final wakeCtrl = TextEditingController(text: wakePetName);
+  // Menu Pengaturan Bersih (Tanpa Input Nama Pet & Tanpa Saklar Emoji)
+  void _showVisualSettingsDialog() {
     int selectedColor = themeColorIndex;
-    bool tempEmojiStyle = useEmojiStyle;
+    bool tempSfx = enableRobotSfx;
 
     showDialog(
       context: context,
       builder: (context) => StatefulBuilder(
         builder: (context, setDialogState) => AlertDialog(
-          title: const Text("Wake Word & Mode Wajah"),
-          content: SingleChildScrollView(
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                const Text("Warna Mata Neon:", style: TextStyle(fontSize: 13)),
-                const SizedBox(height: 10),
-                Row(
-                  mainAxisAlignment: MainAxisAlignment.spaceAround,
-                  children: List.generate(themeColors.length, (idx) {
-                    return GestureDetector(
-                      onTap: () => setDialogState(() => selectedColor = idx),
-                      child: CircleAvatar(
-                        radius: 16,
-                        backgroundColor: themeColors[idx],
-                        child: selectedColor == idx
-                            ? const Icon(Icons.check,
-                                color: Colors.black, size: 18)
-                            : null,
-                      ),
-                    );
-                  }),
-                ),
-                const SizedBox(height: 16),
-                SwitchListTile(
-                  contentPadding: EdgeInsets.zero,
-                  title: const Text("Gunakan Emoji Bawaan XiaoZhi",
-                      style: TextStyle(fontSize: 13)),
-                  subtitle: const Text(
-                      "Aktif: 21 Emoji XiaoZhi • Nonaktif: Wajah Robot Neon",
-                      style: TextStyle(fontSize: 11)),
-                  value: tempEmojiStyle,
-                  onChanged: (v) => setDialogState(() => tempEmojiStyle = v),
-                ),
-                const SizedBox(height: 10),
-                TextField(
-                  controller: wakeCtrl,
-                  decoration: const InputDecoration(
-                    labelText: "Nama Panggilan (Sesuai Web XiaoZhi)",
-                    helperText:
-                        "Panggil dengan: \"Hai / Halo / Hello [Nama ini]\"",
-                  ),
-                ),
-                const SizedBox(height: 12),
-                Text(
-                  "Lokasi GPS: $locationName\nMAC Address: $deviceMac",
-                  style: const TextStyle(fontSize: 11, color: Colors.white54),
-                ),
-              ],
-            ),
+          title: const Text("Tampilan & Suara Ekspresi"),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text("Warna Neon Robot:", style: TextStyle(fontSize: 13)),
+              const SizedBox(height: 10),
+              Row(
+                mainAxisAlignment: MainAxisAlignment.spaceAround,
+                children: List.generate(themeColors.length, (idx) {
+                  return GestureDetector(
+                    onTap: () => setDialogState(() => selectedColor = idx),
+                    child: CircleAvatar(
+                      radius: 16,
+                      backgroundColor: themeColors[idx],
+                      child: selectedColor == idx
+                          ? const Icon(Icons.check,
+                              color: Colors.black, size: 18)
+                          : null,
+                    ),
+                  );
+                }),
+              ),
+              const SizedBox(height: 16),
+              SwitchListTile(
+                contentPadding: EdgeInsets.zero,
+                title: const Text("Efek Suara Ekspresi (SFX Robot)",
+                    style: TextStyle(fontSize: 13)),
+                subtitle: const Text(
+                    "Bunyi chirp, beep, & efek suara saat ganti ekspresi/bermain",
+                    style: TextStyle(fontSize: 11)),
+                value: tempSfx,
+                onChanged: (v) => setDialogState(() => tempSfx = v),
+              ),
+              const Divider(),
+              Text(
+                "Nama Pet (Sync Server): $petName\nLokasi GPS: $locationName\nMAC Address: $deviceMac",
+                style: const TextStyle(fontSize: 11, color: Colors.white54),
+              ),
+            ],
           ),
           actions: [
             TextButton(
@@ -1715,20 +2096,11 @@ class _PetHomeScreenState extends State<PetHomeScreen>
             ElevatedButton(
               onPressed: () async {
                 final prefs = await SharedPreferences.getInstance();
-                final newWake = wakeCtrl.text.trim().isEmpty
-                    ? "kimmi"
-                    : wakeCtrl.text.trim();
-                await prefs.setString('wakePetName', newWake);
                 await prefs.setInt('themeColorIndex', selectedColor);
-                await prefs.setBool('useEmojiStyle', tempEmojiStyle);
+                await prefs.setBool('enableRobotSfx', tempSfx);
                 setState(() {
-                  wakePetName = newWake;
                   themeColorIndex = selectedColor;
-                  useEmojiStyle = tempEmojiStyle;
-                  if (sessionState == SessionState.standbyWakeWord) {
-                    statusSubtitle =
-                        "Standby • Panggil \"Hai $wakePetName\" untuk bicara";
-                  }
+                  enableRobotSfx = tempSfx;
                 });
                 if (context.mounted) Navigator.pop(context);
               },
@@ -1741,19 +2113,26 @@ class _PetHomeScreenState extends State<PetHomeScreen>
   }
 }
 
-class RobotFacePainter extends CustomPainter {
+// =========================================================================
+// PAINTER 1: WAJAH ROBOT EMO + ALIS ARTIKULASI + TANGAN & JARI EKSPRESIF
+// =========================================================================
+class EmoRobotFaceAndHandsPainter extends CustomPainter {
   final XiaoZhiEmotion emotion;
+  final HandGesture handGesture;
   final double blinkValue;
   final bool isTalking;
   final double talkValue;
+  final double handAnimValue;
   final Offset gazeOffset;
   final Color faceColor;
 
-  RobotFacePainter({
+  EmoRobotFaceAndHandsPainter({
     required this.emotion,
+    required this.handGesture,
     required this.blinkValue,
     required this.isTalking,
     required this.talkValue,
+    required this.handAnimValue,
     required this.gazeOffset,
     required this.faceColor,
   });
@@ -1765,24 +2144,48 @@ class RobotFacePainter extends CustomPainter {
       ..style = PaintingStyle.fill;
 
     final glowPaint = Paint()
-      ..color = faceColor.withOpacity(0.35)
+      ..color = faceColor.withOpacity(0.32)
       ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 18);
 
-    double eyeWidth = 68;
-    double eyeHeight = 82 * (1.0 - blinkValue * 0.92);
+    double eyeWidth = 66;
+    double eyeHeight = 80 * (1.0 - blinkValue * 0.92);
 
-    final gazeShift = Offset(gazeOffset.dx * 18, gazeOffset.dy * 14);
+    final gazeShift = Offset(gazeOffset.dx * 16, gazeOffset.dy * 12);
     final leftCenter =
-        Offset(size.width * 0.26, size.height * 0.42) + gazeShift;
+        Offset(size.width * 0.30, size.height * 0.44) + gazeShift;
     final rightCenter =
-        Offset(size.width * 0.74, size.height * 0.42) + gazeShift;
+        Offset(size.width * 0.70, size.height * 0.44) + gazeShift;
 
+    // 1. Jika Mode DEAD (Mati setelah ditembak), gambar Cincin Halo Malaikat di atas kepala
+    if (emotion == XiaoZhiEmotion.dead) {
+      final haloCenter = Offset(size.width * 0.5, size.height * 0.11);
+      final haloGlow = Paint()
+        ..color = Colors.amberAccent.withOpacity(0.5)
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 10
+        ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 12);
+      final haloStroke = Paint()
+        ..color = Colors.amberAccent
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 5;
+      canvas.drawOval(
+          Rect.fromCenter(center: haloCenter, width: 110, height: 26),
+          haloGlow);
+      canvas.drawOval(
+          Rect.fromCenter(center: haloCenter, width: 110, height: 26),
+          haloStroke);
+    }
+
+    // 2. Gambar Alis Mata Dinamis di atas kedua mata (Gaya EMO Pet)
+    _drawEyebrows(canvas, leftCenter, rightCenter, eyeWidth);
+
+    // 3. Gambar Kedua Bola Mata
     _drawCustomEye(
         canvas, leftCenter, eyeWidth, eyeHeight, paint, glowPaint, true);
     _drawCustomEye(
         canvas, rightCenter, eyeWidth, eyeHeight, paint, glowPaint, false);
 
-    // Pipi merona untuk ekspresi ceria / sayang / malu
+    // 4. Pipi Merona
     if (emotion == XiaoZhiEmotion.loving ||
         emotion == XiaoZhiEmotion.kissy ||
         emotion == XiaoZhiEmotion.happy ||
@@ -1793,43 +2196,146 @@ class RobotFacePainter extends CustomPainter {
         ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 10);
       canvas.drawOval(
         Rect.fromCenter(
-            center: leftCenter.translate(-20, 52), width: 34, height: 16),
+            center: leftCenter.translate(-18, 50), width: 34, height: 16),
         blushPaint,
       );
       canvas.drawOval(
         Rect.fromCenter(
-            center: rightCenter.translate(20, 52), width: 34, height: 16),
+            center: rightCenter.translate(18, 50), width: 34, height: 16),
         blushPaint,
       );
     }
 
-    // Air mata untuk crying
+    // 5. Genangan Air Mata
     if (emotion == XiaoZhiEmotion.crying) {
       final tearPaint = Paint()..color = Colors.lightBlueAccent;
+      final double tearOffset = handAnimValue * 10;
       canvas.drawOval(
         Rect.fromCenter(
-            center: leftCenter.translate(0, 54), width: 12, height: 22),
+            center: leftCenter.translate(-6, 52 + tearOffset),
+            width: 12,
+            height: 22),
         tearPaint,
       );
       canvas.drawOval(
         Rect.fromCenter(
-            center: rightCenter.translate(0, 54), width: 12, height: 22),
+            center: rightCenter.translate(6, 52 + tearOffset),
+            width: 12,
+            height: 22),
         tearPaint,
       );
     }
 
-    // Kacamata jembatan untuk mode Cool
+    // 6. Kacamata Visor Cool
     if (emotion == XiaoZhiEmotion.cool) {
       final bridgePaint = Paint()
         ..color = faceColor
         ..strokeWidth = 6
         ..style = PaintingStyle.stroke;
-      canvas.drawLine(
-          leftCenter.translate(34, -8), rightCenter.translate(-34, -8), bridgePaint);
+      canvas.drawLine(leftCenter.translate(32, -8),
+          rightCenter.translate(-32, -8), bridgePaint);
     }
 
-    // Gambar Mulut Tunggal (Anti-Tumpuk)
+    // 7. Gambar Mulut Anti-Tumpuk
     _drawMouth(canvas, size, gazeShift * 0.5);
+
+    // 8. Gambar Tangan & Jari Robot Ekspresif
+    _drawExpressiveHands(canvas, size, paint, glowPaint);
+  }
+
+  void _drawEyebrows(
+      Canvas canvas, Offset leftEye, Offset rightEye, double eyeW) {
+    final browPaint = Paint()
+      ..color = faceColor
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 7.5
+      ..strokeCap = StrokeCap.round;
+
+    double leftOuterY = -56;
+    double leftInnerY = -56;
+    double rightInnerY = -56;
+    double rightOuterY = -56;
+
+    switch (emotion) {
+      case XiaoZhiEmotion.angry:
+        leftOuterY = -64;
+        leftInnerY = -42;
+        rightInnerY = -42;
+        rightOuterY = -64;
+        break;
+      case XiaoZhiEmotion.confident:
+      case XiaoZhiEmotion.cool:
+        leftOuterY = -58;
+        leftInnerY = -46;
+        rightInnerY = -54;
+        rightOuterY = -68;
+        break;
+      case XiaoZhiEmotion.sad:
+      case XiaoZhiEmotion.crying:
+      case XiaoZhiEmotion.embarrassed:
+        leftOuterY = -42;
+        leftInnerY = -62;
+        rightInnerY = -62;
+        rightOuterY = -42;
+        break;
+      case XiaoZhiEmotion.thinking:
+      case XiaoZhiEmotion.confused:
+        leftOuterY = -50;
+        leftInnerY = -50;
+        rightInnerY = -70;
+        rightOuterY = -66;
+        break;
+      case XiaoZhiEmotion.surprised:
+      case XiaoZhiEmotion.shocked:
+        leftOuterY = -70;
+        leftInnerY = -74;
+        rightInnerY = -74;
+        rightOuterY = -70;
+        break;
+      case XiaoZhiEmotion.happy:
+      case XiaoZhiEmotion.laughing:
+      case XiaoZhiEmotion.loving:
+      case XiaoZhiEmotion.winking:
+        leftOuterY = -60;
+        leftInnerY = -64;
+        rightInnerY = -64;
+        rightOuterY = -60;
+        break;
+      case XiaoZhiEmotion.sleepy:
+      case XiaoZhiEmotion.dead:
+        leftOuterY = -44;
+        leftInnerY = -48;
+        rightInnerY = -48;
+        rightOuterY = -44;
+        break;
+      default:
+        leftOuterY = -56;
+        leftInnerY = -56;
+        rightInnerY = -56;
+        rightOuterY = -56;
+        break;
+    }
+
+    final leftPath = Path()
+      ..moveTo(leftEye.dx - eyeW * 0.48, leftEye.dy + leftOuterY)
+      ..quadraticBezierTo(
+        leftEye.dx,
+        leftEye.dy + ((leftOuterY + leftInnerY) / 2) - 6,
+        leftEye.dx + eyeW * 0.48,
+        leftEye.dy + leftInnerY,
+      );
+
+    final rightPath = Path()
+      ..moveTo(rightEye.dx - eyeW * 0.48, rightEye.dy + rightInnerY)
+      ..quadraticBezierTo(
+        rightEye.dx,
+        rightEye.dy + ((rightInnerY + rightOuterY) / 2) - 6,
+        rightEye.dx + eyeW * 0.48,
+        rightEye.dy + rightOuterY,
+      );
+
+    canvas.drawPath(leftPath, browPaint);
+    canvas.drawPath(rightPath, browPaint);
   }
 
   void _drawCustomEye(Canvas canvas, Offset center, double w, double h,
@@ -1839,6 +2345,15 @@ class RobotFacePainter extends CustomPainter {
       ..style = PaintingStyle.stroke
       ..strokeWidth = 9
       ..strokeCap = StrokeCap.round;
+
+    if (emotion == XiaoZhiEmotion.dead || emotion == XiaoZhiEmotion.dizzy) {
+      double r = 24;
+      canvas.drawLine(
+          center.translate(-r, -r), center.translate(r, r), strokePaint);
+      canvas.drawLine(
+          center.translate(r, -r), center.translate(-r, r), strokePaint);
+      return;
+    }
 
     if ((emotion == XiaoZhiEmotion.winking ||
             emotion == XiaoZhiEmotion.kissy ||
@@ -1860,7 +2375,7 @@ class RobotFacePainter extends CustomPainter {
         emotion == XiaoZhiEmotion.relaxed ||
         emotion == XiaoZhiEmotion.delicious) {
       canvas.drawArc(
-        Rect.fromCenter(center: center.translate(0, 10), width: w, height: 55),
+        Rect.fromCenter(center: center.translate(0, 10), width: w, height: 52),
         pi,
         pi,
         false,
@@ -1869,18 +2384,9 @@ class RobotFacePainter extends CustomPainter {
       return;
     }
 
-    if (emotion == XiaoZhiEmotion.dizzy) {
-      double r = 24;
-      canvas.drawLine(
-          center.translate(-r, -r), center.translate(r, r), strokePaint);
-      canvas.drawLine(
-          center.translate(r, -r), center.translate(-r, r), strokePaint);
-      return;
-    }
-
     if (emotion == XiaoZhiEmotion.loving) {
       final path = Path();
-      double s = 34;
+      double s = 32;
       path.moveTo(center.dx, center.dy + s * 0.8);
       path.cubicTo(center.dx - s * 1.4, center.dy, center.dx - s * 0.7,
           center.dy - s * 1.1, center.dx, center.dy - s * 0.3);
@@ -1895,12 +2401,12 @@ class RobotFacePainter extends CustomPainter {
       h *= 0.22;
     } else if (emotion == XiaoZhiEmotion.surprised ||
         emotion == XiaoZhiEmotion.shocked) {
-      w = 74;
-      h = 74 * (1.0 - blinkValue * 0.9);
+      w = 72;
+      h = 72 * (1.0 - blinkValue * 0.9);
     } else if (emotion == XiaoZhiEmotion.confused && isLeft) {
-      h *= 0.65;
+      h *= 0.62;
     } else if (emotion == XiaoZhiEmotion.cool) {
-      h *= 0.68;
+      h *= 0.66;
     }
 
     final rect = RRect.fromRectAndRadius(
@@ -1963,10 +2469,7 @@ class RobotFacePainter extends CustomPainter {
       ..color = faceColor
       ..style = PaintingStyle.fill;
 
-    // 1. Jika sedang mengeluarkan suara bicara (isTalking == true),
-    // HANYA gambar 1 bentuk mulut kapsul dinamis dari tinggi 8px -> 36px.
-    // Tidak pernah berganti ke garis lengkung di tengah kalimat sehingga bebas tumpuk!
-    if (isTalking) {
+    if (isTalking && emotion != XiaoZhiEmotion.dead) {
       final double openHeight = 10.0 + (talkValue * 28.0);
       final double openWidth = 42.0 + (talkValue * 14.0);
       canvas.drawRRect(
@@ -1980,8 +2483,25 @@ class RobotFacePainter extends CustomPainter {
       return;
     }
 
-    // 2. Jika sedang diam (tidak ada suara keluar), gambar mulut sesuai 21 emosi XiaoZhi:
     switch (emotion) {
+      case XiaoZhiEmotion.dead:
+        // Mulut miring + lidah menjulur keluar saat mati
+        canvas.drawLine(
+          mouthCenter.translate(-26, 2),
+          mouthCenter.translate(26, -2),
+          strokePaint,
+        );
+        final tonguePaint = Paint()..color = Colors.pinkAccent;
+        canvas.drawRRect(
+          RRect.fromRectAndRadius(
+            Rect.fromCenter(
+                center: mouthCenter.translate(8, 14), width: 18, height: 22),
+            const Radius.circular(9),
+          ),
+          tonguePaint,
+        );
+        break;
+
       case XiaoZhiEmotion.laughing:
       case XiaoZhiEmotion.funny:
         final path = Path()
@@ -2014,7 +2534,6 @@ class RobotFacePainter extends CustomPainter {
 
       case XiaoZhiEmotion.delicious:
       case XiaoZhiEmotion.silly:
-        // Senyum dengan lidah menjulur
         canvas.drawArc(
           Rect.fromCenter(
               center: mouthCenter.translate(0, -6), width: 56, height: 30),
@@ -2093,6 +2612,241 @@ class RobotFacePainter extends CustomPainter {
     }
   }
 
+  // Menggambar Tangan & Jari Robot Neon Ekspresif
+  void _drawExpressiveHands(
+      Canvas canvas, Size size, Paint fillPaint, Paint glowPaint) {
+    if (handGesture == HandGesture.none) return;
+
+    final double bounce = (handAnimValue - 0.5) * 16;
+
+    switch (handGesture) {
+      case HandGesture.wave:
+        final palm = Offset(size.width * 0.88, size.height * 0.52 + bounce);
+        _drawPalmWithFingers(
+          canvas,
+          palm,
+          fillPaint,
+          glowPaint,
+          fingerAngles: [-0.45, -0.15, 0.12, 0.38],
+          fingerLengths: [22, 26, 25, 20],
+          rotation: (handAnimValue - 0.5) * 0.45,
+        );
+        break;
+
+      case HandGesture.peace:
+        // Gestur 2 Jari Peace (V-Sign)
+        final palm = Offset(size.width * 0.88, size.height * 0.55 + bounce * 0.5);
+        _drawPalmWithFingers(
+          canvas,
+          palm,
+          fillPaint,
+          glowPaint,
+          fingerAngles: [-0.24, 0.22],
+          fingerLengths: [32, 32],
+          rotation: -0.1,
+        );
+        break;
+
+      case HandGesture.thumbsUp:
+        // Gestur Jempol Keren
+        final palm = Offset(size.width * 0.86, size.height * 0.58 + bounce * 0.4);
+        _drawPalmWithFingers(
+          canvas,
+          palm,
+          fillPaint,
+          glowPaint,
+          fingerAngles: [-0.85],
+          fingerLengths: [30],
+        );
+        break;
+
+      case HandGesture.thinkingChin:
+        // Tangan di bawah dagu mengetuk jari telunjuk
+        final palm = Offset(
+            size.width * 0.62, size.height * 0.90 + (handAnimValue * 5));
+        _drawPalmWithFingers(
+          canvas,
+          palm,
+          fillPaint,
+          glowPaint,
+          fingerAngles: [-0.35],
+          fingerLengths: [26],
+        );
+        break;
+
+      case HandGesture.angryFists:
+        // Kedua kepalan tinju bergetar
+        final shake = sin(handAnimValue * pi * 4) * 6;
+        final leftFist =
+            Offset(size.width * 0.12 + shake, size.height * 0.62);
+        final rightFist =
+            Offset(size.width * 0.88 - shake, size.height * 0.62);
+        _drawPalmWithFingers(canvas, leftFist, fillPaint, glowPaint,
+            fingerAngles: [], fingerLengths: []);
+        _drawPalmWithFingers(canvas, rightFist, fillPaint, glowPaint,
+            fingerAngles: [], fingerLengths: []);
+        break;
+
+      case HandGesture.coverCheeks:
+        final leftPalm =
+            Offset(size.width * 0.15, size.height * 0.60 + bounce * 0.3);
+        final rightPalm =
+            Offset(size.width * 0.85, size.height * 0.60 + bounce * 0.3);
+        _drawPalmWithFingers(
+          canvas,
+          leftPalm,
+          fillPaint,
+          glowPaint,
+          fingerAngles: [-0.2, 0.0, 0.2],
+          fingerLengths: [18, 20, 18],
+        );
+        _drawPalmWithFingers(
+          canvas,
+          rightPalm,
+          fillPaint,
+          glowPaint,
+          fingerAngles: [-0.2, 0.0, 0.2],
+          fingerLengths: [18, 20, 18],
+        );
+        break;
+
+      case HandGesture.handsUp:
+        // Kedua tangan angkat ke atas saat ditembak!
+        final leftUp =
+            Offset(size.width * 0.12, size.height * 0.25 + bounce * 0.6);
+        final rightUp =
+            Offset(size.width * 0.88, size.height * 0.25 + bounce * 0.6);
+        _drawPalmWithFingers(
+          canvas,
+          leftUp,
+          fillPaint,
+          glowPaint,
+          fingerAngles: [-0.4, -0.12, 0.15, 0.4],
+          fingerLengths: [22, 25, 25, 20],
+        );
+        _drawPalmWithFingers(
+          canvas,
+          rightUp,
+          fillPaint,
+          glowPaint,
+          fingerAngles: [-0.4, -0.12, 0.15, 0.4],
+          fingerLengths: [22, 25, 25, 20],
+        );
+        break;
+
+      case HandGesture.deadDrop:
+        // Tangan terkulai lemas di bawah saat mati
+        final leftDead = Offset(size.width * 0.16, size.height * 0.86);
+        final rightDead = Offset(size.width * 0.84, size.height * 0.86);
+        _drawPalmWithFingers(
+          canvas,
+          leftDead,
+          fillPaint,
+          glowPaint,
+          fingerAngles: [2.8, 3.1, 3.4],
+          fingerLengths: [18, 20, 18],
+        );
+        _drawPalmWithFingers(
+          canvas,
+          rightDead,
+          fillPaint,
+          glowPaint,
+          fingerAngles: [2.8, 3.1, 3.4],
+          fingerLengths: [18, 20, 18],
+        );
+        break;
+
+      case HandGesture.none:
+        break;
+    }
+  }
+
+  void _drawPalmWithFingers(
+    Canvas canvas,
+    Offset palmCenter,
+    Paint fillPaint,
+    Paint glowPaint, {
+    required List<double> fingerAngles,
+    required List<double> fingerLengths,
+    double rotation = 0.0,
+  }) {
+    canvas.save();
+    canvas.translate(palmCenter.dx, palmCenter.dy);
+    canvas.rotate(rotation);
+
+    // Telapak tangan bulat neon
+    final palmRect = RRect.fromRectAndRadius(
+      Rect.fromCenter(center: Offset.zero, width: 36, height: 32),
+      const Radius.circular(14),
+    );
+    canvas.drawRRect(palmRect, glowPaint);
+    canvas.drawRRect(palmRect, fillPaint);
+
+    // Jari-jari artikulasi
+    final fingerStroke = Paint()
+      ..color = fillPaint.color
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 8.5
+      ..strokeCap = StrokeCap.round;
+
+    for (int i = 0; i < fingerAngles.length; i++) {
+      final double ang = fingerAngles[i] - (pi / 2);
+      final double len = fingerLengths[i];
+      final start = Offset(cos(ang) * 14, sin(ang) * 14);
+      final end = Offset(cos(ang) * (14 + len), sin(ang) * (14 + len));
+      canvas.drawLine(start, end, fingerStroke);
+    }
+
+    canvas.restore();
+  }
+
   @override
-  bool shouldRepaint(covariant RobotFacePainter oldDelegate) => true;
+  bool shouldRepaint(covariant EmoRobotFaceAndHandsPainter oldDelegate) => true;
+}
+
+// =========================================================================
+// PAINTER 2: ANIMASI RETAK KACA LAYAR (SAAT DITEMBAK / SHOOT & DIE)
+// =========================================================================
+class ScreenCrackPainter extends CustomPainter {
+  final Offset origin;
+  final List<List<Offset>> branches;
+
+  ScreenCrackPainter({required this.origin, required this.branches});
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final glowPaint = Paint()
+      ..color = Colors.cyanAccent.withOpacity(0.45)
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 5
+      ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 6);
+
+    final crackPaint = Paint()
+      ..color = Colors.white.withOpacity(0.9)
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 2.2
+      ..strokeCap = StrokeCap.round;
+
+    // Lubang titik tembakan di kaca
+    canvas.drawCircle(origin, 10, glowPaint);
+    canvas.drawCircle(origin, 6, Paint()..color = Colors.white);
+
+    // Cincin retakan melingkar
+    canvas.drawCircle(origin, 28, crackPaint);
+    canvas.drawCircle(origin, 58, crackPaint..strokeWidth = 1.4);
+
+    // Garis-garis retakan menyebar
+    for (final branch in branches) {
+      if (branch.length < 2) continue;
+      final path = Path()..moveTo(branch.first.dx, branch.first.dy);
+      for (int i = 1; i < branch.length; i++) {
+        path.lineTo(branch[i].dx, branch[i].dy);
+      }
+      canvas.drawPath(path, glowPaint);
+      canvas.drawPath(path, crackPaint..strokeWidth = 2.2);
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant ScreenCrackPainter oldDelegate) => true;
 }
