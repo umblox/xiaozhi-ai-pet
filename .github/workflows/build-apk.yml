@@ -42,7 +42,7 @@ jobs:
       - name: Fetch Dependencies
         run: flutter pub get
 
-      - name: Patch Android SDK 35, GPS, Native Bridge & Pub-Cache
+      - name: Patch Android SDK 35, GPS, YouTube Player Bridge & Pub-Cache
         run: |
           python3 - << 'EOF'
           import os
@@ -57,7 +57,7 @@ jobs:
               with open(main_dart, "w") as f:
                   f.write(code)
 
-          # 2. Suntikkan Permission Lengkap (Termasuk GPS Fine/Coarse & Kamera) ke AndroidManifest.xml
+          # 2. Suntikkan Permission Lengkap & Cleartext Traffic ke AndroidManifest.xml
           manifest_path = "android/app/src/main/AndroidManifest.xml"
           with open(manifest_path, "r") as f:
               content = f.read()
@@ -75,126 +75,245 @@ jobs:
           """
           if "android.permission.ACCESS_FINE_LOCATION" not in content:
               content = content.replace("<application", permissions + "\n    <application", 1)
+          if "usesCleartextTraffic" not in content:
+              content = content.replace("<application", '<application android:usesCleartextTraffic="true"', 1)
           content = content.replace('android:label="xiaozhi_pet"', 'android:label="XiaoZhi AI Pet"')
           with open(manifest_path, "w") as f:
               f.write(content)
 
-          # 3. Suntikkan Jembatan Native GPS, Volume & Keep-Screen-On ke MainActivity.kt
+          # 3. Suntikkan Jembatan Native GPS, Volume & YouTube Audio Streamer ke MainActivity.kt
           kt_path = "android/app/src/main/kotlin/id/xiaozhi/aipet/xiaozhi_pet/MainActivity.kt"
           if os.path.exists(kt_path):
-              kt_code = """package id.xiaozhi.aipet.xiaozhi_pet
-
-          import android.annotation.SuppressLint
-          import android.content.Context
-          import android.location.Location
-          import android.location.LocationListener
-          import android.location.LocationManager
-          import android.media.AudioManager
-          import android.os.Bundle
-          import android.os.Handler
-          import android.os.Looper
-          import android.view.WindowManager
-          import io.flutter.embedding.android.FlutterActivity
-          import io.flutter.embedding.engine.FlutterEngine
-          import io.flutter.plugin.common.MethodChannel
-
-          class MainActivity: FlutterActivity() {
-              private val CHANNEL = "id.xiaozhi.aipet/device"
-
-              override fun onCreate(savedInstanceState: Bundle?) {
-                  super.onCreate(savedInstanceState)
-                  window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-              }
-
-              @SuppressLint("MissingPermission")
-              override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
-                  super.configureFlutterEngine(flutterEngine)
-                  MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL).setMethodCallHandler { call, result ->
-                      when (call.method) {
-                          "getGpsLocation" -> {
-                              try {
-                                  val lm = getSystemService(Context.LOCATION_SERVICE) as LocationManager
-                                  val providers = listOf(
-                                      LocationManager.GPS_PROVIDER,
-                                      LocationManager.NETWORK_PROVIDER,
-                                      LocationManager.PASSIVE_PROVIDER
-                                  )
-                                  var bestLocation: Location? = null
-                                  for (p in providers) {
-                                      if (lm.isProviderEnabled(p)) {
-                                          val loc = lm.getLastKnownLocation(p)
-                                          if (loc != null) {
-                                              if (bestLocation == null || loc.accuracy < bestLocation!!.accuracy) {
-                                                  bestLocation = loc
-                                              }
-                                          }
-                                      }
-                                  }
-                                  if (bestLocation != null) {
-                                      result.success(mapOf(
-                                          "lat" to bestLocation!!.latitude,
-                                          "lon" to bestLocation!!.longitude
-                                      ))
-                                  } else {
-                                      val activeProvider = when {
-                                          lm.isProviderEnabled(LocationManager.NETWORK_PROVIDER) -> LocationManager.NETWORK_PROVIDER
-                                          lm.isProviderEnabled(LocationManager.GPS_PROVIDER) -> LocationManager.GPS_PROVIDER
-                                          else -> null
-                                      }
-                                      if (activeProvider != null) {
-                                          var replied = false
-                                          val listener = object : LocationListener {
-                                              override fun onLocationChanged(loc: Location) {
-                                                  if (!replied) {
-                                                      replied = true
-                                                      lm.removeUpdates(this)
-                                                      result.success(mapOf("lat" to loc.latitude, "lon" to loc.longitude))
-                                                  }
-                                              }
-                                              override fun onProviderEnabled(provider: String) {}
-                                              override fun onProviderDisabled(provider: String) {}
-                                              @Deprecated("Deprecated in Java")
-                                              override fun onStatusChanged(provider: String?, status: Int, extras: Bundle?) {}
-                                          }
-                                          lm.requestLocationUpdates(activeProvider, 0L, 0f, listener, Looper.getMainLooper())
-                                          Handler(Looper.getMainLooper()).postDelayed({
-                                              if (!replied) {
-                                                  replied = true
-                                                  lm.removeUpdates(listener)
-                                                  result.success(null)
-                                              }
-                                          }, 4000)
-                                      } else {
-                                          result.success(null)
-                                      }
-                                  }
-                              } catch (e: Exception) {
-                                  result.success(null)
-                              }
-                          }
-                          "getVolume" -> {
-                              val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
-                              val max = am.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
-                              val cur = am.getStreamVolume(AudioManager.STREAM_MUSIC)
-                              val pct = if (max > 0) (cur * 100) / max else 80
-                              result.success(pct)
-                          }
-                          "setVolume" -> {
-                              val level = call.argument<Int>("volume") ?: 80
-                              val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
-                              val max = am.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
-                              val target = ((level.coerceIn(0, 100) * max) / 100.0).toInt()
-                              am.setStreamVolume(AudioManager.STREAM_MUSIC, target, 0)
-                              result.success(true)
-                          }
-                          else -> result.notImplemented()
-                      }
-                  }
-              }
-          }
-          """
+              kt_lines = [
+                  "package id.xiaozhi.aipet.xiaozhi_pet",
+                  "",
+                  "import android.annotation.SuppressLint",
+                  "import android.content.Context",
+                  "import android.location.Location",
+                  "import android.location.LocationListener",
+                  "import android.location.LocationManager",
+                  "import android.media.AudioManager",
+                  "import android.os.Bundle",
+                  "import android.os.Handler",
+                  "import android.os.Looper",
+                  "import android.view.ViewGroup",
+                  "import android.view.WindowManager",
+                  "import android.webkit.WebChromeClient",
+                  "import android.webkit.WebResourceRequest",
+                  "import android.webkit.WebSettings",
+                  "import android.webkit.WebView",
+                  "import android.webkit.WebViewClient",
+                  "import android.widget.FrameLayout",
+                  "import io.flutter.embedding.android.FlutterActivity",
+                  "import io.flutter.embedding.engine.FlutterEngine",
+                  "import io.flutter.plugin.common.MethodChannel",
+                  "import java.net.HttpURLConnection",
+                  "import java.net.URL",
+                  "import java.net.URLEncoder",
+                  "import java.util.regex.Pattern",
+                  "import kotlin.concurrent.thread",
+                  "",
+                  "class MainActivity: FlutterActivity() {",
+                  "    private val CHANNEL = \"id.xiaozhi.aipet/device\"",
+                  "    private var ytWebView: WebView? = null",
+                  "    private val mainHandler = Handler(Looper.getMainLooper())",
+                  "    private var ytIsPlaying = false",
+                  "",
+                  "    private val ytKeepAliveRunnable = object : Runnable {",
+                  "        override fun run() {",
+                  "            if (ytIsPlaying) {",
+                  "                injectAutoPlayJs()",
+                  "                mainHandler.postDelayed(this, 1600)",
+                  "            }",
+                  "        }",
+                  "    }",
+                  "",
+                  "    override fun onCreate(savedInstanceState: Bundle?) {",
+                  "        super.onCreate(savedInstanceState)",
+                  "        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)",
+                  "    }",
+                  "",
+                  "    @SuppressLint(\"SetJavaScriptEnabled\")",
+                  "    private fun ensureYtWebView(): WebView {",
+                  "        if (ytWebView != null) return ytWebView!!",
+                  "        val wv = WebView(this)",
+                  "        wv.settings.javaScriptEnabled = true",
+                  "        wv.settings.mediaPlaybackRequiresUserGesture = false",
+                  "        wv.settings.domStorageEnabled = true",
+                  "        wv.settings.mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW",
+                  "        wv.settings.userAgentString = \"Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Mobile Safari/537.36\"",
+                  "        wv.webChromeClient = WebChromeClient()",
+                  "        wv.webViewClient = object : WebViewClient() {",
+                  "            override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {",
+                  "                val u = request?.url?.toString() ?: return false",
+                  "                if (u.startsWith(\"http://\") || u.startsWith(\"https://\")) {",
+                  "                    return false",
+                  "                }",
+                  "                return true",
+                  "            }",
+                  "            override fun onPageFinished(view: WebView?, url: String?) {",
+                  "                super.onPageFinished(view, url)",
+                  "                injectAutoPlayJs()",
+                  "            }",
+                  "        }",
+                  "        val root = findViewById<ViewGroup>(android.R.id.content)",
+                  "        val params = FrameLayout.LayoutParams(1, 1)",
+                  "        wv.alpha = 0.01f",
+                  "        root.addView(wv, params)",
+                  "        ytWebView = wv",
+                  "        return wv",
+                  "    }",
+                  "",
+                  "    private fun injectAutoPlayJs() {",
+                  "        if (!ytIsPlaying) return",
+                  "        val js = \"(function(){try{var s=document.querySelector('.ytp-ad-skip-button,.ytp-ad-skip-button-modern,.videoAdUiSkipButton');if(s)s.click();var v=document.querySelector('video');if(v){v.muted=false;v.volume=1.0;if(v.paused)v.play();}}catch(e){}})();\"",
+                  "        ytWebView?.evaluateJavascript(js, null)",
+                  "    }",
+                  "",
+                  "    @SuppressLint(\"MissingPermission\")",
+                  "    override fun configureFlutterEngine(flutterEngine: FlutterEngine) {",
+                  "        super.configureFlutterEngine(flutterEngine)",
+                  "        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL).setMethodCallHandler { call, result ->",
+                  "            when (call.method) {",
+                  "                \"getGpsLocation\" -> {",
+                  "                    try {",
+                  "                        val lm = getSystemService(Context.LOCATION_SERVICE) as LocationManager",
+                  "                        val providers = listOf(",
+                  "                            LocationManager.GPS_PROVIDER,",
+                  "                            LocationManager.NETWORK_PROVIDER,",
+                  "                            LocationManager.PASSIVE_PROVIDER",
+                  "                        )",
+                  "                        var bestLocation: Location? = null",
+                  "                        for (p in providers) {",
+                  "                            if (lm.isProviderEnabled(p)) {",
+                  "                                val loc = lm.getLastKnownLocation(p)",
+                  "                                if (loc != null) {",
+                  "                                    if (bestLocation == null || loc.accuracy < bestLocation!!.accuracy) {",
+                  "                                        bestLocation = loc",
+                  "                                    }",
+                  "                                }",
+                  "                            }",
+                  "                        }",
+                  "                        if (bestLocation != null) {",
+                  "                            result.success(mapOf(",
+                  "                                \"lat\" to bestLocation!!.latitude,",
+                  "                                \"lon\" to bestLocation!!.longitude",
+                  "                            ))",
+                  "                        } else {",
+                  "                            val activeProvider = when {",
+                  "                                lm.isProviderEnabled(LocationManager.NETWORK_PROVIDER) -> LocationManager.NETWORK_PROVIDER",
+                  "                                lm.isProviderEnabled(LocationManager.GPS_PROVIDER) -> LocationManager.GPS_PROVIDER",
+                  "                                else -> null",
+                  "                            }",
+                  "                            if (activeProvider != null) {",
+                  "                                var replied = false",
+                  "                                val listener = object : LocationListener {",
+                  "                                    override fun onLocationChanged(loc: Location) {",
+                  "                                        if (!replied) {",
+                  "                                            replied = true",
+                  "                                            lm.removeUpdates(this)",
+                  "                                            result.success(mapOf(\"lat\" to loc.latitude, \"lon\" to loc.longitude))",
+                  "                                        }",
+                  "                                    }",
+                  "                                    override fun onProviderEnabled(provider: String) {}",
+                  "                                    override fun onProviderDisabled(provider: String) {}",
+                  "                                    @Deprecated(\"Deprecated in Java\")",
+                  "                                    override fun onStatusChanged(provider: String?, status: Int, extras: Bundle?) {}",
+                  "                                }",
+                  "                                lm.requestLocationUpdates(activeProvider, 0L, 0f, listener, Looper.getMainLooper())",
+                  "                                mainHandler.postDelayed({",
+                  "                                    if (!replied) {",
+                  "                                        replied = true",
+                  "                                        lm.removeUpdates(listener)",
+                  "                                        result.success(null)",
+                  "                                    }",
+                  "                                }, 4000)",
+                  "                            } else {",
+                  "                                result.success(null)",
+                  "                            }",
+                  "                        }",
+                  "                    } catch (e: Exception) {",
+                  "                        result.success(null)",
+                  "                    }",
+                  "                }",
+                  "                \"getVolume\" -> {",
+                  "                    val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager",
+                  "                    val max = am.getStreamMaxVolume(AudioManager.STREAM_MUSIC)",
+                  "                    val cur = am.getStreamVolume(AudioManager.STREAM_MUSIC)",
+                  "                    val pct = if (max > 0) (cur * 100) / max else 80",
+                  "                    result.success(pct)",
+                  "                }",
+                  "                \"setVolume\" -> {",
+                  "                    val level = call.argument<Int>(\"volume\") ?: 80",
+                  "                    val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager",
+                  "                    val max = am.getStreamMaxVolume(AudioManager.STREAM_MUSIC)",
+                  "                    val target = ((level.coerceIn(0, 100) * max) / 100.0).toInt()",
+                  "                    am.setStreamVolume(AudioManager.STREAM_MUSIC, target, 0)",
+                  "                    result.success(true)",
+                  "                }",
+                  "                \"playYoutube\" -> {",
+                  "                    val query = call.argument<String>(\"query\") ?: \"\"",
+                  "                    if (query.isBlank()) {",
+                  "                        result.success(mapOf(\"success\" to false))",
+                  "                        return@setMethodCallHandler",
+                  "                    }",
+                  "                    thread {",
+                  "                        var videoId = \"\"",
+                  "                        try {",
+                  "                            val enc = URLEncoder.encode(\"$query official audio\", \"UTF-8\")",
+                  "                            val url = URL(\"https://www.youtube.com/results?search_query=$enc&hl=id\")",
+                  "                            val conn = url.openConnection() as HttpURLConnection",
+                  "                            conn.requestMethod = \"GET\"",
+                  "                            conn.connectTimeout = 7000",
+                  "                            conn.readTimeout = 7000",
+                  "                            conn.setRequestProperty(\"User-Agent\", \"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36\")",
+                  "                            val html = conn.inputStream.bufferedReader().use { it.readText() }",
+                  "                            val m = Pattern.compile(\"\\\"videoId\\\":\\\"([a-zA-Z0-9_-]{11})\\\"\").matcher(html)",
+                  "                            if (m.find()) {",
+                  "                                videoId = m.group(1) ?: \"\"",
+                  "                            }",
+                  "                        } catch (_: Exception) {}",
+                  "                        mainHandler.post {",
+                  "                            val wv = ensureYtWebView()",
+                  "                            ytIsPlaying = true",
+                  "                            mainHandler.removeCallbacks(ytKeepAliveRunnable)",
+                  "                            if (videoId.isNotEmpty()) {",
+                  "                                wv.loadUrl(\"https://m.youtube.com/watch?v=$videoId&autoplay=1\")",
+                  "                            } else {",
+                  "                                val qEnc = URLEncoder.encode(query, \"UTF-8\")",
+                  "                                wv.loadUrl(\"https://m.youtube.com/results?search_query=$qEnc\")",
+                  "                            }",
+                  "                            mainHandler.postDelayed(ytKeepAliveRunnable, 1500)",
+                  "                            result.success(mapOf(",
+                  "                                \"success\" to true,",
+                  "                                \"videoId\" to videoId,",
+                  "                                \"query\" to query",
+                  "                            ))",
+                  "                        }",
+                  "                    }",
+                  "                }",
+                  "                \"stopYoutube\" -> {",
+                  "                    ytIsPlaying = false",
+                  "                    mainHandler.removeCallbacks(ytKeepAliveRunnable)",
+                  "                    ytWebView?.evaluateJavascript(\"try{var v=document.querySelector('video');if(v)v.pause();}catch(e){}\", null)",
+                  "                    ytWebView?.loadUrl(\"about:blank\")",
+                  "                    result.success(true)",
+                  "                }",
+                  "                else -> result.notImplemented()",
+                  "            }",
+                  "        }",
+                  "    }",
+                  "",
+                  "    override fun onDestroy() {",
+                  "        ytIsPlaying = false",
+                  "        mainHandler.removeCallbacks(ytKeepAliveRunnable)",
+                  "        ytWebView?.destroy()",
+                  "        super.onDestroy()",
+                  "    }",
+                  "}"
+              ]
               with open(kt_path, "w") as f:
-                  f.write("\n".join(line[10:] if line.startswith("          ") else line for line in kt_code.splitlines()))
+                  f.write("\n".join(kt_lines))
 
           # 4. Tambahkan toleransi JVM target di gradle.properties
           prop_path = "android/gradle.properties"
@@ -221,12 +340,10 @@ jobs:
                       with open(rl_path, "r") as f:
                           rl = f.read()
 
-                      # Bersihkan duplikat dari cache build sebelumnya
                       rl = rl.replace("  @override\n  dynamic noSuchMethod(Invocation i) => super.noSuchMethod(i);\n", "")
                       rl = rl.replace("  dynamic noSuchMethod(Invocation i) => super.noSuchMethod(i);\n", "")
                       rl = rl.replace("{bool request = true}, {bool request = true}", "{bool request = true}")
 
-                      # Pasang tepat 1 kali
                       rl = rl.replace(
                           "class RecordLinux extends RecordPlatform {",
                           "class RecordLinux extends RecordPlatform {\n  @override\n  dynamic noSuchMethod(Invocation i) => super.noSuchMethod(i);"
@@ -288,6 +405,6 @@ jobs:
         with:
           tag_name: latest-build
           name: "XiaoZhi AI Pet - Pure XiaoZhi Edition"
-          body: "Download langsung file **xiaozhi-ai-pet.apk** di bawah ini (100% Opus XiaoZhi Audio + Wake Word + GPS + MCP Camera Vision)."
+          body: "Download langsung file **xiaozhi-ai-pet.apk** di bawah ini (100% Opus XiaoZhi Audio + Wake Word + YouTube Music DJ/Guitar/Piano/Vocal + Physical Touch)."
           files: xiaozhi-ai-pet.apk
           prerelease: false
